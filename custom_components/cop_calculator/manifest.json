@@ -1,10 +1,12 @@
 {
   "domain": "cop_calculator",
   "name": "COP Calculator",
+  "version": "1.0.0",
   "documentation": "https://github.com/tijmenvanstraten/COP_calculator",
   "issue_tracker": "https://github.com/tijmenvanstraten/COP_calculator/issues",
   "dependencies": [],
   "codeowners": ["@tijmenvanstraten"],
   "requirements": []
 }
+
 
