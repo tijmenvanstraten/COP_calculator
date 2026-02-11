@@ -1,11 +1,12 @@
 {
   "domain": "cop_calculator",
   "name": "COP Calculator",
-  "version": "2.0.0",
+  "version": "2.0.2",
   "documentation": "https://github.com/tijmenvanstraten/COP_calculator",
   "requirements": [],
   "dependencies": [],
   "codeowners": ["@tijmenvanstraten"],
   "config_flow": true,
   "iot_class": "local_polling"
+
 }
