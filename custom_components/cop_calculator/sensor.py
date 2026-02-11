@@ -1,4 +1,4 @@
-from homeassistant.helpers.entity import Entity
+from homeassistant.components.sensor import SensorEntity
 from homeassistant.const import CONF_NAME
 from datetime import datetime
 from collections import defaultdict
@@ -202,6 +202,7 @@ class COPRuimteverwarmingSensor(Entity):
     def __init__(self, hass):
         self.hass = hass
         self.monitor = RuimteverwarmingMonitor()
+        self._attr_unique_id = "cop_ruimteverwarming_sensor"
         self._state = None
 
     @property
@@ -212,6 +213,14 @@ class COPRuimteverwarmingSensor(Entity):
     def state(self):
         return self._state
 
+    @property
+    def native_unit_of_measurement(self):
+        return "COP"
+
+    @property
+    def icon(self):
+        return "mdi:calculator"
+        
     def update(self):
         modus = self.hass.states.get("sensor.control_unit_operation_state_2").state
         elektrisch_vermogen = self.bereken_elektrisch_vermogen()
@@ -255,6 +264,7 @@ class COPKoelingSensor(Entity):
     def __init__(self, hass):
         self.hass = hass
         self.monitor = KoelingMonitor()
+        self._attr_unique_id = "cop_koeling_sensor"
         self._state = None
 
     @property
@@ -265,6 +275,14 @@ class COPKoelingSensor(Entity):
     def state(self):
         return self._state
 
+    @property
+    def native_unit_of_measurement(self):
+        return "COP"
+
+    @property
+    def icon(self):
+        return "mdi:calculator"
+    
     def update(self):
         modus = self.hass.states.get("sensor.control_unit_operation_state_2").state
         elektrisch_vermogen = self.bereken_elektrisch_vermogen()
@@ -308,6 +326,7 @@ class COPDHWSensor(Entity):
     def __init__(self, hass):
         self.hass = hass
         self.dhw_monitor = DHWMonitor()
+        self._attr_unique_id = "cop_dhw_sensor"
         self._state = None
 
     @property
@@ -317,6 +336,14 @@ class COPDHWSensor(Entity):
     @property
     def state(self):
         return self._state
+
+     @property
+    def native_unit_of_measurement(self):
+        return "COP"
+
+    @property
+    def icon(self):
+        return "mdi:calculator"
 
     def update(self):
         modus = self.hass.states.get("sensor.control_unit_operation_state_2").state
@@ -354,14 +381,23 @@ class COPPeriodeSensor(Entity):
         self.thermisch_power_integrator = PowerIntegrator()
         self._state = None
         self._attributes = {}
-
+        self._attr_unique_id = f"cop_{modus}_{periode_type}_sensor"
+        
     @property
     def name(self):
         return f"COP {self.modus} {self.periode_type}"
 
     @property
-    def state(self):
+    def native_value(self):
         return self._state
+
+    @property
+    def native_unit_of_measurement(self):
+        return "COP"
+
+    @property
+    def icon(self):
+        return "mdi:calculator"
 
     @property
     def extra_state_attributes(self):
@@ -503,3 +539,4 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         COPPeriodeSensor(hass, "operation_state_dhw_on", "lifetime")
     ]
     async_add_entities(sensors, True)
+
