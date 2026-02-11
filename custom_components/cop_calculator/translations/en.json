@@ -1,0 +1,8 @@
+{
+  "title": "COP Calculator",
+  "sensor": {
+    "cop_space_heating_sensor": { "name": "COP Space Heating" },
+    "cop_cooling_sensor": { "name": "COP Cooling" },
+    "cop_dhw_sensor": { "name": "COP DHW" }
+  }
+}
