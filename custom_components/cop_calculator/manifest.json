@@ -1,7 +1,7 @@
 {
   "domain": "cop_calculator",
   "name": "COP Calculator",
-  "version": "2.0.2",
+  "version": "2.0.4",
   "documentation": "https://github.com/tijmenvanstraten/COP_calculator",
   "requirements": [],
   "dependencies": [],
@@ -10,3 +10,4 @@
   "iot_class": "local_polling"
 
 }
+
