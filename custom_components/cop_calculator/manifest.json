@@ -6,9 +6,10 @@
   "issue_tracker": "https://github.com/tijmenvanstraten/COP_calculator/issues",
   "dependencies": [],
   "codeowners": ["@tijmenvanstraten"],
-  "requirements": []
+  "requirements": [],
   "homeassistant": "2023.12.0"
 }
+
 
 
 
