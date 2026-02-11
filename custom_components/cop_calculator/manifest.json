@@ -1,7 +1,7 @@
 {
   "domain": "cop_calculator",
   "name": "COP Calculator",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "documentation": "https://github.com/tijmenvanstraten/COP_calculator",
   "issue_tracker": "https://github.com/tijmenvanstraten/COP_calculator/issues",
   "dependencies": [],
@@ -9,6 +9,7 @@
   "requirements": [],
   "homeassistant": "2023.12.0"
 }
+
 
 
 
