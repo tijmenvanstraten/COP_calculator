@@ -1,8 +1,44 @@
 {
   "title": "COP Calculator",
-  "sensor": {
-    "cop_space_heating_sensor": { "name": "COP Ruimteverwarming" },
-    "cop_cooling_sensor": { "name": "COP Koeling" },
-    "cop_dhw_sensor": { "name": "COP DHW" }
+
+  "entity": {
+    "sensor": {
+      "cop_space_heating_lifetime": {
+        "name": "COP ruimteverwarming (totaal)"
+      },
+      "cop_space_heating_year": {
+        "name": "COP ruimteverwarming (jaar)"
+      },
+      "cop_space_heating_month": {
+        "name": "COP ruimteverwarming (maand)"
+      },
+
+      "cop_cooling_lifetime": {
+        "name": "COP koeling (totaal)"
+      },
+      "cop_cooling_year": {
+        "name": "COP koeling (jaar)"
+      },
+      "cop_cooling_month": {
+        "name": "COP koeling (maand)"
+      },
+
+      "cop_dhw_lifetime": {
+        "name": "COP tapwater (totaal)"
+      },
+      "cop_dhw_year": {
+        "name": "COP tapwater (jaar)"
+      },
+      "cop_dhw_month": {
+        "name": "COP tapwater (maand)"
+      },
+
+      "cop_space_heating_realtime": {
+        "name": "COP ruimteverwarming (actueel)"
+      },
+      "cop_cooling_realtime": {
+        "name": "COP koeling (actueel)"
+      }
+    }
   }
 }
