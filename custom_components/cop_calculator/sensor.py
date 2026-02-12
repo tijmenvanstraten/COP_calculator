@@ -1,4 +1,5 @@
 from homeassistant.components.sensor import SensorEntity
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.entity import DeviceInfo
 from datetime import datetime
 from collections import defaultdict
@@ -8,6 +9,7 @@ from .const import DOMAIN
 # Base sensor class
 # ============================
 class COPBaseSensor(SensorEntity):
+    """Base class for all COP sensors."""
     def __init__(self, language="en"):
         self.lang = language
 
@@ -24,14 +26,15 @@ class COPBaseSensor(SensorEntity):
 # Power Integrator
 # ============================
 class PowerIntegrator:
+    """Integrates power measurements over time to calculate energy."""
     def __init__(self):
         self.measurements = []
 
     def add_measurement(self, power, timestamp=None):
         if power is None:
             return
-        # Factor check: alles naar W
-        if power < 0.01:  # vermoedelijk kW
+        # Convert kW to W if necessary
+        if power < 0.01:
             power *= 1000
         if timestamp is None:
             timestamp = datetime.now()
@@ -44,8 +47,8 @@ class PowerIntegrator:
         for i in range(1, len(self.measurements)):
             t1, p1 = self.measurements[i - 1]
             t2, p2 = self.measurements[i]
-            dt = (t2 - t1).total_seconds() / 3600
-            total_wh += ((p1 + p2) / 2) * dt
+            dt_h = (t2 - t1).total_seconds() / 3600
+            total_wh += ((p1 + p2) / 2) * dt_h
         return total_wh / 1000  # kWh
 
     def calculate_energy_by_month(self):
@@ -61,8 +64,8 @@ class PowerIntegrator:
             for i in range(1, len(vals)):
                 t1, p1 = vals[i-1]
                 t2, p2 = vals[i]
-                dt = (t2 - t1).total_seconds() / 3600
-                total_wh += ((p1+p2)/2)*dt
+                dt_h = (t2 - t1).total_seconds() / 3600
+                total_wh += ((p1 + p2)/2) * dt_h
             energy[key] = total_wh / 1000
         return energy
 
@@ -79,8 +82,8 @@ class PowerIntegrator:
             for i in range(1, len(vals)):
                 t1, p1 = vals[i-1]
                 t2, p2 = vals[i]
-                dt = (t2 - t1).total_seconds() / 3600
-                total_wh += ((p1+p2)/2)*dt
+                dt_h = (t2 - t1).total_seconds() / 3600
+                total_wh += ((p1 + p2)/2) * dt_h
             energy[key] = total_wh / 1000
         return energy
 
@@ -88,6 +91,7 @@ class PowerIntegrator:
 # COP Monitor Base
 # ============================
 class COPMonitor:
+    """Tracks a COP cycle for heating or cooling."""
     def __init__(self):
         self.electric = PowerIntegrator()
         self.thermal = PowerIntegrator()
@@ -110,12 +114,13 @@ class COPMonitor:
     def calculate_cop(self):
         e = self.electric.calculate_energy()
         t = self.thermal.calculate_energy()
-        return t/e if e > 0 else None
+        return round(t/e,2) if e>0 else None
 
 # ============================
-# Space Heating Sensor
+# Space Heating Sensor (Realtime COP)
 # ============================
 class COPSpaceHeatingSensor(COPBaseSensor):
+    """Realtime COP for space heating."""
     def __init__(self, hass, language="en"):
         super().__init__(language)
         self.hass = hass
@@ -162,7 +167,7 @@ class COPSpaceHeatingSensor(COPBaseSensor):
             outside = float(self.hass.states.get("sensor.shelly_warmtepomp_buitenunit_active_power").state)
             inside = float(self.hass.states.get("sensor.shelly_warmtepomp_binnenunit_active_power").state)
             total = outside + inside
-            if total < 0.01:  # vermoedelijk kW
+            if total < 0.01:
                 total *= 1000
             return total
         except (AttributeError, ValueError, TypeError):
@@ -173,16 +178,16 @@ class COPSpaceHeatingSensor(COPBaseSensor):
             outlet = float(self.hass.states.get("sensor.control_unit_water_outlet_temperature_2").state)
             inlet = float(self.hass.states.get("sensor.control_unit_water_inlet_temperature_2").state)
             flow = float(self.hass.states.get("sensor.control_unit_water_flow_2").state)
-            delta_t = outlet - inlet
-            power = abs(flow * delta_t * 4.18 * 1000 / 3600)
+            power = abs(flow * (outlet - inlet) * 4.18 * 1000 / 3600)
             return power
         except (AttributeError, ValueError, TypeError):
             return None
 
 # ============================
-# Cooling Sensor
+# Cooling Sensor (Realtime COP)
 # ============================
 class COPCoolingSensor(COPSpaceHeatingSensor):
+    """Realtime COP for cooling."""
     def __init__(self, hass, language="en"):
         super().__init__(hass, language)
         self.monitor = COPMonitor()
@@ -215,16 +220,16 @@ class COPCoolingSensor(COPSpaceHeatingSensor):
             outlet = float(self.hass.states.get("sensor.control_unit_water_outlet_temperature_koeling").state)
             inlet = float(self.hass.states.get("sensor.control_unit_water_inlet_temperature_koeling").state)
             flow = float(self.hass.states.get("sensor.control_unit_water_flow_2").state)
-            delta_t = outlet - inlet
-            power = abs(flow * delta_t * 4.18 * 1000 / 3600)
+            power = abs(flow * (outlet - inlet) * 4.18 * 1000 / 3600)
             return power
         except (AttributeError, ValueError, TypeError):
             return None
 
 # ============================
-# DHW Sensor
+# DHW Sensor (No realtime COP)
 # ============================
 class COPDHWSensor(COPBaseSensor):
+    """COP for domestic hot water (DHW) cycles."""
     def __init__(self, hass, language="en"):
         super().__init__(language)
         self.hass = hass
@@ -239,7 +244,7 @@ class COPDHWSensor(COPBaseSensor):
 
     @property
     def name(self):
-        return "COP DHW" if self.lang=="en" else "COP DHW"
+        return "COP DHW"
 
     @property
     def native_value(self):
@@ -272,7 +277,7 @@ class COPDHWSensor(COPBaseSensor):
                 self.end_cycle(current_temp)
                 thermal_energy = self.calculate_thermal_energy()
                 electric_energy = self.calculate_electric_energy(electric_power)
-                self._state = thermal_energy / electric_energy if electric_energy else None
+                self._state = round(thermal_energy / electric_energy,2) if electric_energy else None
 
     def start_cycle(self, temp):
         self.start_temp = temp
@@ -295,14 +300,14 @@ class COPDHWSensor(COPBaseSensor):
     def calculate_thermal_energy(self):
         if self.start_temp is None or self.end_temp is None:
             return None
-        volume = 260
+        volume = 260  # liters
         total_delta = (self.end_temp - self.start_temp) + self.total_delta
-        return (volume * total_delta * 4.18) / 3600
+        return (volume * total_delta * 4.18)/3600  # kWh
 
     def calculate_electric_energy(self, power):
         if not self.start_time or not self.end_time:
             return None
-        duration_h = (self.end_time - self.start_time).total_seconds() / 3600
+        duration_h = (self.end_time - self.start_time).total_seconds()/3600
         return (power * duration_h)/1000
 
     def get_electric_power(self):
@@ -318,14 +323,15 @@ class COPDHWSensor(COPBaseSensor):
             return 0
 
 # ============================
-# COP Periode Sensor (Month/Year/Lifetime)
+# COP Period Sensor (Month/Year/Lifetime)
 # ============================
-class COPPeriodeSensor(COPBaseSensor):
-    def __init__(self, hass, mode, period_type, language="en"):
+class COPPeriodSensor(COPBaseSensor, RestoreEntity):
+    """Persistent COP sensor per period for heating, cooling, DHW."""
+    def __init__(self, hass, mode: str, period_type: str, language="en"):
         super().__init__(language)
         self.hass = hass
         self.mode = mode
-        self.period_type = period_type
+        self.period_type = period_type  # month/year/lifetime
         self.electric_integrator = PowerIntegrator()
         self.thermal_integrator = PowerIntegrator()
         self._state = None
@@ -334,7 +340,7 @@ class COPPeriodeSensor(COPBaseSensor):
 
     @property
     def name(self):
-        return f"COP {self.mode} {self.period_type}" if self.lang=="en" else f"COP {self.mode} {self.period_type}"
+        return f"COP {self.mode} {self.period_type}"
 
     @property
     def native_value(self):
@@ -345,23 +351,28 @@ class COPPeriodeSensor(COPBaseSensor):
         return "COP"
 
     @property
-    def icon(self):
-        return "mdi:calculator"
-
-    @property
     def extra_state_attributes(self):
         return self._attributes
+
+    async def async_added_to_hass(self):
+        """Restore previous state after HA restart."""
+        last_state = await self.async_get_last_state()
+        if last_state:
+            self._state = last_state.state
+            if last_state.attributes:
+                self._attributes = dict(last_state.attributes)
 
     def update(self):
         electric_power = self.get_electric_power()
         thermal_power = self.get_thermal_power()
+
         self.electric_integrator.add_measurement(electric_power)
         if thermal_power is not None:
             self.thermal_integrator.add_measurement(thermal_power)
 
-        if self.period_type == "maand":
+        if self.period_type == "month":
             cop_period = self.calculate_cop_by_month()
-        elif self.period_type == "jaar":
+        elif self.period_type == "year":
             cop_period = self.calculate_cop_by_year()
         elif self.period_type == "lifetime":
             self._state = self.calculate_lifetime_cop()
@@ -369,30 +380,25 @@ class COPPeriodeSensor(COPBaseSensor):
         else:
             return
 
-        self._attributes = {f"{k[0]}-{k[1]}": v for k,v in cop_period.items()}
+        self._attributes = {f"{k[0]}-{k[1]}" if self.period_type=="month" else f"{k}": v 
+                            for k,v in cop_period.items()}
         values = [v for v in cop_period.values() if v is not None]
-        self._state = sum(values)/len(values) if values else None
+        self._state = round(sum(values)/len(values),2) if values else None
 
     def calculate_cop_by_month(self):
         e = self.electric_integrator.calculate_energy_by_month()
         t = self.thermal_integrator.calculate_energy_by_month()
-        cop = {}
-        for k in e:
-            cop[k] = t.get(k,0)/e[k] if e[k] > 0 else None
-        return cop
+        return {k: round(t.get(k,0)/e[k],2) if e[k]>0 else None for k in e}
 
     def calculate_cop_by_year(self):
         e = self.electric_integrator.calculate_energy_by_year()
         t = self.thermal_integrator.calculate_energy_by_year()
-        cop = {}
-        for k in e:
-            cop[k] = t.get(k,0)/e[k] if e[k] > 0 else None
-        return cop
+        return {k: round(t.get(k,0)/e[k],2) if e[k]>0 else None for k in e}
 
     def calculate_lifetime_cop(self):
         e = self.electric_integrator.calculate_energy()
         t = self.thermal_integrator.calculate_energy()
-        return t/e if e>0 else None
+        return round(t/e,2) if e>0 else None
 
     def get_electric_power(self):
         try:
@@ -417,7 +423,7 @@ class COPPeriodeSensor(COPBaseSensor):
                 flow = float(self.hass.states.get("sensor.control_unit_water_flow_2").state)
             else:
                 return None
-            return abs(flow * (outlet - inlet) * 4.18 * 1000 / 3600)
+            return abs(flow * (outlet-inlet) * 4.18 * 1000 / 3600)
         except (AttributeError, ValueError, TypeError):
             return None
 
@@ -430,15 +436,15 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         COPSpaceHeatingSensor(hass, language=lang),
         COPCoolingSensor(hass, language=lang),
         COPDHWSensor(hass, language=lang),
-        COPPeriodeSensor(hass, "operation_state_heat_thermo_on", "maand", language=lang),
-        COPPeriodeSensor(hass, "operation_state_heat_thermo_on", "jaar", language=lang),
-        COPPeriodeSensor(hass, "operation_state_heat_thermo_on", "lifetime", language=lang),
-        COPPeriodeSensor(hass, "operation_state_cool_thermo_on", "maand", language=lang),
-        COPPeriodeSensor(hass, "operation_state_cool_thermo_on", "jaar", language=lang),
-        COPPeriodeSensor(hass, "operation_state_cool_thermo_on", "lifetime", language=lang),
-        COPPeriodeSensor(hass, "operation_state_dhw_on", "maand", language=lang),
-        COPPeriodeSensor(hass, "operation_state_dhw_on", "jaar", language=lang),
-        COPPeriodeSensor(hass, "operation_state_dhw_on", "lifetime", language=lang),
+        COPPeriodSensor(hass, "operation_state_heat_thermo_on", "month", language=lang),
+        COPPeriodSensor(hass, "operation_state_heat_thermo_on", "year", language=lang),
+        COPPeriodSensor(hass, "operation_state_heat_thermo_on", "lifetime", language=lang),
+        COPPeriodSensor(hass, "operation_state_cool_thermo_on", "month", language=lang),
+        COPPeriodSensor(hass, "operation_state_cool_thermo_on", "year", language=lang),
+        COPPeriodSensor(hass, "operation_state_cool_thermo_on", "lifetime", language=lang),
+        COPPeriodSensor(hass, "operation_state_dhw_on", "month", language=lang),
+        COPPeriodSensor(hass, "operation_state_dhw_on", "year", language=lang),
+        COPPeriodSensor(hass, "operation_state_dhw_on", "lifetime", language=lang),
     ]
     async_add_entities(sensors, True)
 
