@@ -1,8 +1,44 @@
 {
   "title": "COP Calculator",
-  "sensor": {
-    "cop_space_heating_sensor": { "name": "COP Space Heating" },
-    "cop_cooling_sensor": { "name": "COP Cooling" },
-    "cop_dhw_sensor": { "name": "COP DHW" }
+
+  "entity": {
+    "sensor": {
+      "cop_space_heating_lifetime": {
+        "name": "Space heating COP (lifetime)"
+      },
+      "cop_space_heating_year": {
+        "name": "Space heating COP (year)"
+      },
+      "cop_space_heating_month": {
+        "name": "Space heating COP (month)"
+      },
+
+      "cop_cooling_lifetime": {
+        "name": "Cooling COP (lifetime)"
+      },
+      "cop_cooling_year": {
+        "name": "Cooling COP (year)"
+      },
+      "cop_cooling_month": {
+        "name": "Cooling COP (month)"
+      },
+
+      "cop_dhw_lifetime": {
+        "name": "Domestic hot water COP (lifetime)"
+      },
+      "cop_dhw_year": {
+        "name": "Domestic hot water COP (year)"
+      },
+      "cop_dhw_month": {
+        "name": "Domestic hot water COP (month)"
+      },
+
+      "cop_space_heating_realtime": {
+        "name": "Space heating COP (realtime)"
+      },
+      "cop_cooling_realtime": {
+        "name": "Cooling COP (realtime)"
+      }
+    }
   }
 }
