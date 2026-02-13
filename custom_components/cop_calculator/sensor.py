@@ -1,357 +1,370 @@
 from __future__ import annotations
 
+from datetime import datetime
+from collections import defaultdict
+from typing import Optional, Dict, Tuple, List
+
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.entity import DeviceInfo
-from datetime import datetime
-from collections import defaultdict
-from .const import DOMAIN
+
+from .const import DOMAIN, DEFAULT_LANGUAGE, DEFAULT_PUMP_POWER
 
 
-# =========================================================
-# Utility: Power → Energy integrator (internal only)
-# =========================================================
+# ============================================================
+# Power integration (W -> kWh) with period aggregation
+# ============================================================
+
 class PowerIntegrator:
-    def __init__(self):
-        self.measurements: list[tuple[datetime, float]] = []
+    """
+    Integrates power measurements (W) into energy (kWh).
+    Keeps everything in memory to avoid recorder load.
+    """
 
-    def add(self, power_w: float | None, timestamp: datetime | None = None):
+    def __init__(self) -> None:
+        self._samples: List[Tuple[datetime, float]] = []
+
+    def add_sample(self, power_w: Optional[float], ts: Optional[datetime] = None) -> None:
         if power_w is None:
             return
 
-        # Safety: normalize to W if value looks like kW
+        # Safety check: avoid kW/W mismatch
         if power_w < 0.01:
             power_w *= 1000
 
-        if timestamp is None:
-            timestamp = datetime.now()
+        if ts is None:
+            ts = datetime.now()
 
-        self.measurements.append((timestamp, power_w))
+        self._samples.append((ts, power_w))
 
-    def _integrate(self, values: list[tuple[datetime, float]]) -> float:
-        if len(values) < 2:
+    def energy_kwh(self) -> float:
+        if len(self._samples) < 2:
             return 0.0
 
         total_wh = 0.0
-        for i in range(1, len(values)):
-            t1, p1 = values[i - 1]
-            t2, p2 = values[i]
+        for i in range(1, len(self._samples)):
+            t1, p1 = self._samples[i - 1]
+            t2, p2 = self._samples[i]
             dt_h = (t2 - t1).total_seconds() / 3600
             total_wh += ((p1 + p2) / 2) * dt_h
 
-        return total_wh / 1000  # kWh
+        return total_wh / 1000
 
-    def energy_total(self) -> float:
-        return self._integrate(self.measurements)
+    def energy_by_month(self) -> Dict[Tuple[int, int], float]:
+        grouped = defaultdict(list)
+        for ts, p in self._samples:
+            grouped[(ts.year, ts.month)].append((ts, p))
 
-    def energy_by_month(self) -> dict[tuple[int, int], float]:
-        buckets = defaultdict(list)
-        for t, p in self.measurements:
-            buckets[(t.year, t.month)].append((t, p))
+        result: Dict[Tuple[int, int], float] = {}
+        for key, samples in grouped.items():
+            if len(samples) < 2:
+                result[key] = 0.0
+                continue
 
-        return {k: self._integrate(v) for k, v in buckets.items()}
+            wh = 0.0
+            for i in range(1, len(samples)):
+                t1, p1 = samples[i - 1]
+                t2, p2 = samples[i]
+                dt_h = (t2 - t1).total_seconds() / 3600
+                wh += ((p1 + p2) / 2) * dt_h
 
-    def energy_by_year(self) -> dict[int, float]:
-        buckets = defaultdict(list)
-        for t, p in self.measurements:
-            buckets[t.year].append((t, p))
+            result[key] = wh / 1000
 
-        return {k: self._integrate(v) for k, v in buckets.items()}
+        return result
 
+    def energy_by_year(self) -> Dict[int, float]:
+        grouped = defaultdict(list)
+        for ts, p in self._samples:
+            grouped[ts.year].append((ts, p))
 
-# =========================================================
-# Base sensor
-# =========================================================
-class COPBaseSensor(SensorEntity, RestoreEntity):
-    _attr_icon = "mdi:calculator"
-    _attr_native_unit_of_measurement = "COP"
+        result: Dict[int, float] = {}
+        for year, samples in grouped.items():
+            if len(samples) < 2:
+                result[year] = 0.0
+                continue
 
-    def __init__(self, hass, language: str = "en"):
-        self.hass = hass
-        self.lang = language
-        self._state = None
+            wh = 0.0
+            for i in range(1, len(samples)):
+                t1, p1 = samples[i - 1]
+                t2, p2 = samples[i]
+                dt_h = (t2 - t1).total_seconds() / 3600
+                wh += ((p1 + p2) / 2) * dt_h
 
-    @property
-    def device_info(self) -> DeviceInfo:
-        return DeviceInfo(
-            identifiers={(DOMAIN, "cop_calculator")},
-            name="COP Calculator",
-            manufacturer="Tijmen van Straten",
-            model="Calculated COP",
-        )
+            result[year] = wh / 1000
 
-    @property
-    def native_value(self):
-        return self._state
-
-
-# =========================================================
-# Realtime COP (power based)
-# =========================================================
-class RealtimeCOPMonitor:
-    def __init__(self):
-        self.electric = PowerIntegrator()
-        self.thermal = PowerIntegrator()
-        self.active = False
-
-    def start(self):
-        self.electric = PowerIntegrator()
-        self.thermal = PowerIntegrator()
-        self.active = True
-
-    def update(self, electric_w: float, thermal_w: float):
-        if not self.active:
-            return
-        self.electric.add(electric_w)
-        self.thermal.add(thermal_w)
-
-    def stop(self, electric_w: float, thermal_w: float):
-        self.update(electric_w, thermal_w)
-        self.active = False
-
-    def cop(self) -> float | None:
-        e = self.electric.energy_total()
-        t = self.thermal.energy_total()
-        return t / e if e > 0 else None
+        return result
 
 
-# =========================================================
-# Space Heating & Cooling Realtime COP
-# =========================================================
-class COPRealtimeSensor(COPBaseSensor):
-    def __init__(self, hass, mode: str, language="en"):
-        super().__init__(hass, language)
-        self.mode = mode
-        self.monitor = RealtimeCOPMonitor()
-        self._attr_unique_id = f"cop_realtime_{mode}"
+# ============================================================
+# DHW thermal energy calculation (tank based)
+# ============================================================
 
-    @property
-    def name(self):
-        if self.mode == "heat":
-            return "COP Realtime Heating" if self.lang == "en" else "COP Realtime Verwarmen"
-        return "COP Realtime Cooling" if self.lang == "en" else "COP Realtime Koelen"
+class DHWThermalCalculator:
+    """
+    Calculates thermal energy for a DHW run based on tank temperature.
+    Correctly handles intermediate temperature drops.
+    """
 
-    async def async_update(self):
-        state = self.hass.states.get("sensor.control_unit_operation_state_2")
-        if not state:
+    def __init__(self, volume_liters: float = 260.0) -> None:
+        self.volume_l = volume_liters
+        self.reset()
+
+    def reset(self) -> None:
+        self.start_temp: Optional[float] = None
+        self.last_temp: Optional[float] = None
+        self.min_temp: Optional[float] = None
+        self.extra_drop: float = 0.0
+
+    def start(self, temp_c: float) -> None:
+        self.start_temp = temp_c
+        self.last_temp = temp_c
+        self.min_temp = temp_c
+        self.extra_drop = 0.0
+
+    def update(self, temp_c: float) -> None:
+        if self.last_temp is None:
+            self.last_temp = temp_c
             return
 
-        electric = self._electric_power_total()
-        thermal = self._thermal_power()
+        delta = temp_c - self.last_temp
+        if delta < 0:
+            self.extra_drop += abs(delta)
 
-        if (
-            (self.mode == "heat" and state.state == "operation_state_heat_thermo_on")
-            or (self.mode == "cool" and state.state == "operation_state_cool_thermo_on")
-        ):
-            if not self.monitor.active:
-                self.monitor.start()
-            self.monitor.update(electric, thermal)
-        else:
-            if self.monitor.active:
-                self.monitor.stop(electric, thermal)
-                self._state = self.monitor.cop()
+        self.last_temp = temp_c
+        self.min_temp = min(self.min_temp, temp_c) if self.min_temp is not None else temp_c
 
-    def _electric_power_total(self) -> float:
-        try:
-            out = float(self.hass.states.get(
-                "sensor.shelly_warmtepomp_buitenunit_active_power").state)
-            inn = float(self.hass.states.get(
-                "sensor.shelly_warmtepomp_binnenunit_active_power").state)
-            return out + inn
-        except Exception:
-            return 0.0
+    def thermal_energy_kwh(self) -> Optional[float]:
+        if self.start_temp is None or self.last_temp is None or self.min_temp is None:
+            return None
 
-    def _thermal_power(self) -> float:
-        try:
-            outlet = float(self.hass.states.get(
-                "sensor.control_unit_water_outlet_temperature_2").state)
-            inlet = float(self.hass.states.get(
-                "sensor.control_unit_water_inlet_temperature_2").state)
-            flow = float(self.hass.states.get(
-                "sensor.control_unit_water_flow_2").state)
-            return abs(flow * (outlet - inlet) * 4.18 * 1000 / 3600)
-        except Exception:
-            return 0.0
+        total_delta = (self.last_temp - self.min_temp) + self.extra_drop
+        # 4.18 kJ/kgK, 1L ≈ 1kg
+        return (self.volume_l * total_delta * 4.18) / 3600
 
 
-# =========================================================
-# DHW COP (cycle based)
-# =========================================================
-class COPDHWSensor(COPBaseSensor):
-    def __init__(self, hass, pump_power_w=59, language="en"):
-        super().__init__(hass, language)
-        self._attr_unique_id = "cop_dhw"
+# ============================================================
+# Electrical power allocation (single source of truth)
+# ============================================================
+
+class ElectricalPowerAllocator:
+    """
+    Central logic for correct electrical power attribution.
+    Prevents double counting and pump leakage into DHW.
+    """
+
+    def __init__(self, pump_power_w: float) -> None:
         self.pump_power = pump_power_w
 
-        self.start_temp = None
-        self.last_temp = None
-        self.temp_losses = 0.0
-        self.start_time = None
-        self.end_time = None
+    def heating_or_cooling_power(
+        self,
+        outside_power: float,
+    ) -> float:
+        """
+        Space heating / cooling:
+        - Outside unit
+        - Circulation pump ONLY
+        - Never electric heater
+        """
+        return outside_power + self.pump_power
+
+    def dhw_heatpump_power(
+        self,
+        outside_power: float,
+        inside_power: float,
+    ) -> float:
+        """
+        DHW via heat pump:
+        - Outside unit
+        - Inside unit
+        - Minus circulation pump
+        """
+        return max(outside_power + inside_power - self.pump_power, 0.0)
+
+    def dhw_heater_power(
+        self,
+        inside_power: float,
+    ) -> float:
+        """
+        DHW via electric heater only:
+        - Inside unit
+        - Minus circulation pump
+        """
+        return max(inside_power - self.pump_power, 0.0)
+
+# ============================================================
+# COP calculation helpers
+# ============================================================
+
+class COPCalculator:
+    """
+    Generic COP calculator.
+    Protects against division by zero and negative power.
+    """
+
+    @staticmethod
+    def cop(thermal_kwh: float, electrical_kwh: float) -> Optional[float]:
+        if thermal_kwh is None or electrical_kwh is None:
+            return None
+        if electrical_kwh <= 0:
+            return None
+        return thermal_kwh / electrical_kwh
+
+
+# ============================================================
+# Heating / Cooling runtime COP
+# ============================================================
+
+class SpaceConditioningRuntime:
+    """
+    Handles heating OR cooling (never both simultaneously).
+    """
+
+    def __init__(self) -> None:
+        self.thermal_integrator = PowerIntegrator()
+        self.electrical_integrator = PowerIntegrator()
+
+    def add_sample(
+        self,
+        thermal_power_w: Optional[float],
+        electrical_power_w: Optional[float],
+        ts: Optional[datetime] = None,
+    ) -> None:
+        self.thermal_integrator.add_sample(thermal_power_w, ts)
+        self.electrical_integrator.add_sample(electrical_power_w, ts)
+
+    def cop(self) -> Optional[float]:
+        return COPCalculator.cop(
+            self.thermal_integrator.energy_kwh(),
+            self.electrical_integrator.energy_kwh(),
+        )
+
+    def monthly_cop(self) -> Dict[Tuple[int, int], Optional[float]]:
+        th = self.thermal_integrator.energy_by_month()
+        el = self.electrical_integrator.energy_by_month()
+
+        result: Dict[Tuple[int, int], Optional[float]] = {}
+        for key in th:
+            result[key] = COPCalculator.cop(th[key], el.get(key, 0.0))
+        return result
+
+    def yearly_cop(self) -> Dict[int, Optional[float]]:
+        th = self.thermal_integrator.energy_by_year()
+        el = self.electrical_integrator.energy_by_year()
+
+        result: Dict[int, Optional[float]] = {}
+        for year in th:
+            result[year] = COPCalculator.cop(th[year], el.get(year, 0.0))
+        return result
+
+
+# ============================================================
+# DHW runtime tracking (heat pump + electric heater)
+# ============================================================
+
+class DHWRuntime:
+    """
+    Tracks a single DHW run and aggregates lifetime/month/year.
+    Correctly handles:
+    - DHW via heat pump (operation_state_dhw_on)
+    - DHW via electric heater (binary_sensor_dhw_heater_2)
+    - parallel DHW electric + space heating
+    """
+
+    def __init__(self, tank_volume_l: float, pump_power_w: float) -> None:
+        self.thermal_calc = DHWThermalCalculator(tank_volume_l)
+        self.electrical_integrator = PowerIntegrator()
+
+        self.allocator = ElectricalPowerAllocator(pump_power_w)
+
         self.active = False
+        self.last_run_cop: Optional[float] = None
 
-    @property
-    def name(self):
-        return "COP DHW"
+    # --------------------
+    # Lifecycle
+    # --------------------
 
-    async def async_update(self):
-        try:
-            temp = float(self.hass.states.get(
-                "sensor.dhw_current_temperature").state)
-        except Exception:
-            return
-
-        heater_on = self.hass.states.get(
-            "binary_sensor.control_unit_dhw_heater_2")
-        heater_active = heater_on and heater_on.state == "on"
-
-        if heater_active or self._temp_rising(temp):
-            if not self.active:
-                self._start_cycle(temp)
-            else:
-                self._update_temp(temp)
-        else:
-            if self.active:
-                self._end_cycle(temp)
-                self._state = self._calculate_cop()
-
-    def _start_cycle(self, temp):
-        self.start_temp = temp
-        self.last_temp = temp
-        self.temp_losses = 0.0
-        self.start_time = datetime.now()
+    def start(self, tank_temp_c: float) -> None:
         self.active = True
+        self.thermal_calc.start(tank_temp_c)
+        self.electrical_integrator = PowerIntegrator()
 
-    def _update_temp(self, temp):
-        delta = temp - self.last_temp
-        if delta < 0:
-            self.temp_losses += abs(delta)
-        self.last_temp = temp
-
-    def _end_cycle(self, temp):
-        self._update_temp(temp)
-        self.end_time = datetime.now()
-        self.active = False
-
-    def _temp_rising(self, temp) -> bool:
-        return self.last_temp is not None and temp > self.last_temp
-
-    def _calculate_cop(self) -> float | None:
-        thermal = self._thermal_energy()
-        electric = self._electric_energy()
-        return thermal / electric if electric and electric > 0 else None
-
-    def _thermal_energy(self) -> float:
-        volume_l = 260
-        total_delta = (self.last_temp - self.start_temp) + self.temp_losses
-        return (volume_l * total_delta * 4.18) / 3600
-
-    def _electric_energy(self) -> float | None:
-        if not self.start_time or not self.end_time:
-            return None
-
-        duration_h = (self.end_time - self.start_time).total_seconds() / 3600
-
-        try:
-            inside = float(self.hass.states.get(
-                "sensor.shelly_warmtepomp_binnenunit_active_power").state)
-            outside = float(self.hass.states.get(
-                "sensor.shelly_warmtepomp_buitenunit_active_power").state)
-        except Exception:
-            return None
-
-        heater_on = self.hass.states.get(
-            "binary_sensor.control_unit_dhw_heater_2")
-        if heater_on and heater_on.state == "on":
-            power = inside - self.pump_power
-        else:
-            power = outside
-
-        return (power * duration_h) / 1000
-
-
-# =========================================================
-# Period COP (month / year / lifetime)
-# =========================================================
-class COPPeriodSensor(COPBaseSensor):
-    def __init__(self, hass, period: str, language="en"):
-        super().__init__(hass, language)
-        self.period = period
-        self.electric = PowerIntegrator()
-        self.thermal = PowerIntegrator()
-        self._attr_unique_id = f"cop_{period}"
-        self._attributes = {}
-
-    @property
-    def name(self):
-        return f"COP {self.period.capitalize()}"
-
-    @property
-    def extra_state_attributes(self):
-        return self._attributes
-
-    async def async_update(self):
-        try:
-            e = float(self.hass.states.get(
-                "sensor.shelly_warmtepomp_buitenunit_active_power").state)
-            i = float(self.hass.states.get(
-                "sensor.shelly_warmtepomp_binnenunit_active_power").state)
-            electric = e + i
-        except Exception:
-            electric = 0
-
-        thermal = None
-        try:
-            outlet = float(self.hass.states.get(
-                "sensor.control_unit_water_outlet_temperature_2").state)
-            inlet = float(self.hass.states.get(
-                "sensor.control_unit_water_inlet_temperature_2").state)
-            flow = float(self.hass.states.get(
-                "sensor.control_unit_water_flow_2").state)
-            thermal = abs(flow * (outlet - inlet) * 4.18 * 1000 / 3600)
-        except Exception:
-            pass
-
-        self.electric.add(electric)
-        if thermal is not None:
-            self.thermal.add(thermal)
-
-        if self.period == "lifetime":
-            e_kwh = self.electric.energy_total()
-            t_kwh = self.thermal.energy_total()
-            self._state = t_kwh / e_kwh if e_kwh > 0 else None
+    def stop(self) -> None:
+        if not self.active:
             return
 
-        if self.period == "month":
-            e_map = self.electric.energy_by_month()
-            t_map = self.thermal.energy_by_month()
-        else:
-            e_map = self.electric.energy_by_year()
-            t_map = self.thermal.energy_by_year()
+        thermal_kwh = self.thermal_calc.thermal_energy_kwh()
+        electrical_kwh = self.electrical_integrator.energy_kwh()
 
-        result = {}
-        for k in e_map:
-            result[str(k)] = t_map.get(k, 0) / e_map[k] if e_map[k] > 0 else None
+        self.last_run_cop = COPCalculator.cop(thermal_kwh, electrical_kwh)
+        self.active = False
 
-        self._attributes = result
-        values = [v for v in result.values() if v is not None]
-        self._state = sum(values) / len(values) if values else None
+    # --------------------
+    # Updates
+    # --------------------
 
+    def update_tank_temp(self, temp_c: float) -> None:
+        if self.active:
+            self.thermal_calc.update(temp_c)
 
-# =========================================================
-# Setup
-# =========================================================
-async def async_setup_entry(hass, config_entry, async_add_entities):
-    lang = config_entry.data.get("language", "en")
-    pump_power = config_entry.data.get("circulation_pump_power", 59)
+    def add_heatpump_power(
+        self,
+        outside_power_w: float,
+        inside_power_w: float,
+        ts: Optional[datetime] = None,
+    ) -> None:
+        """
+        DHW via heat pump.
+        Pompvermogen wordt expliciet afgetrokken.
+        """
+        if not self.active:
+            return
 
-    sensors = [
-        COPRealtimeSensor(hass, "heat", lang),
-        COPRealtimeSensor(hass, "cool", lang),
-        COPDHWSensor(hass, pump_power, lang),
-        COPPeriodSensor(hass, "month", lang),
-        COPPeriodSensor(hass, "year", lang),
-        COPPeriodSensor(hass, "lifetime", lang),
-    ]
+        power = self.allocator.dhw_heatpump_power(
+            outside_power_w,
+            inside_power_w,
+        )
+        self.electrical_integrator.add_sample(power, ts)
 
-    async_add_entities(sensors, True)
+    def add_heater_power(
+        self,
+        inside_power_w: float,
+        ts: Optional[datetime] = None,
+    ) -> None:
+        """
+        DHW via electric heater.
+        Pompvermogen wordt expliciet afgetrokken.
+        """
+        if not self.active:
+            return
+
+        power = self.allocator.dhw_heater_power(inside_power_w)
+        self.electrical_integrator.add_sample(power, ts)
+
+    # --------------------
+    # Aggregations
+    # --------------------
+
+    def lifetime_cop(self) -> Optional[float]:
+        return COPCalculator.cop(
+            self.thermal_calc.thermal_energy_kwh(),
+            self.electrical_integrator.energy_kwh(),
+        )
+
+    def monthly_cop(self) -> Dict[Tuple[int, int], Optional[float]]:
+        th = self.thermal_calc.thermal_energy_kwh()
+        el = self.electrical_integrator.energy_by_month()
+
+        result: Dict[Tuple[int, int], Optional[float]] = {}
+        for key, el_kwh in el.items():
+            result[key] = COPCalculator.cop(th, el_kwh)
+        return result
+
+    def yearly_cop(self) -> Dict[int, Optional[float]]:
+        th = self.thermal_calc.thermal_energy_kwh()
+        el = self.electrical_integrator.energy_by_year()
+
+        result: Dict[int, Optional[float]] = {}
+        for year, el_kwh in el.items():
+            result[year] = COPCalculator.cop(th, el_kwh)
+        return result
+
