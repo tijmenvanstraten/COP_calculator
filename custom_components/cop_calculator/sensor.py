@@ -1,156 +1,215 @@
-from __future__ import annotations
-
-from datetime import datetime
-from typing import Optional
-
-from homeassistant.components.sensor import (
-    SensorEntity,
-    SensorDeviceClass,
-    SensorStateClass,
-)
-from homeassistant.helpers.restore_state import RestoreEntity
-from homeassistant.helpers.event import async_track_state_change_event
-from homeassistant.const import STATE_ON, STATE_OFF
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.util.dt import now as ha_now
-
+import logging
+from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.storage import Store
+from homeassistant.const import CONF_NAME
+from homeassistant.util import dt as dt_util
+from datetime import timedelta
+import json
 from .const import (
-    DOMAIN,
-    CONF_POWER_INDOOR,
-    CONF_POWER_OUTDOOR,
-    CONF_POWER_PUMP,
-    CONF_TEMP_INLET,
-    CONF_TEMP_OUTLET,
-    CONF_OPERATION_STATE,
-    CONF_DHW_HEATER_BINARY,
-    CONF_BOILER_VOLUME_L,
-    CONF_LANGUAGE,
+    DOMAIN, SENSOR_INDOOR_POWER, SENSOR_OUTDOOR_POWER, SENSOR_DHW_HEATER,
+    SENSOR_OUTLET_TEMP, SENSOR_INLET_TEMP, SENSOR_FLOW, SENSOR_OPERATION_STATE,
+    SENSOR_DHW_CURRENT_TEMP, SENSOR_DHW_TARGET_TEMP,
+    STATE_HEAT_THERMO, STATE_HEAT_COOL, STATE_DHW,
+    ATTR_PUMP_POWER, ATTR_DHW_TANK_VOLUME,
 )
 
-WATER_HEAT_CAPACITY_WH_PER_L_K = 1.163  # Wh per liter per Kelvin
-SECONDS_PER_HOUR = 3600
+_LOGGER = logging.getLogger(__name__)
 
-class CopEnergyAccumulator(RestoreEntity):
-    """Base class for COP energy accumulation."""
+async def async_setup_entry(hass, entry, async_add_entities):
+    """Set up the COP sensors."""
+    store = hass.data[DOMAIN][entry.entry_id]["store"]
+    pump_power = hass.data[DOMAIN][entry.entry_id]["pump_power"]
+    dhw_tank_volume = hass.data[DOMAIN][entry.entry_id]["dhw_tank_volume"]
 
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_device_class = SensorDeviceClass.NONE
-    _attr_native_unit_of_measurement = ""
+    coordinator = HitachiYutakiCOPDataUpdateCoordinator(
+        hass, store, pump_power, dhw_tank_volume
+    )
+    await coordinator.async_config_entry_first_refresh()
 
-    def __init__(self, hass: HomeAssistant, name: str, period: str):
-        self.hass = hass
-        self._attr_name = name
-        self.period = period  # "month" | "year" | "lifetime"
+    # Realtime COP sensors
+    sensors = [
+        HitachiYutakiCOPSensor(coordinator, "Heating", "realtime"),
+        HitachiYutakiCOPSensor(coordinator, "Cooling", "realtime"),
+    ]
+    # DHW per run sensor
+    sensors.append(HitachiYutakiDHWRunSensor(coordinator))
+    # Maand/jaar/lifetime COP sensors
+    for mode in ["Heating", "Cooling", "DHW"]:
+        for period in ["Monthly", "Yearly", "Lifetime"]:
+            sensors.append(HitachiYutakiCOPSensor(coordinator, mode, period.lower()))
 
-        self._thermal_kwh = 0.0
-        self._electric_kwh = 0.0
-        self._state: Optional[float] = None
+    async_add_entities(sensors, True)
 
-        self._last_reset_marker: Optional[str] = None
+class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
+    """Class to manage fetching data from the API."""
 
-    async def async_added_to_hass(self):
-        last = await self.async_get_last_state()
-        if last:
-            self._thermal_kwh = float(last.attributes.get("thermal_kwh", 0.0))
-            self._electric_kwh = float(last.attributes.get("electric_kwh", 0.0))
-            self._last_reset_marker = last.attributes.get("reset_marker")
+    def __init__(self, hass, store, pump_power, dhw_tank_volume):
+        """Initialize."""
+        self._hass = hass
+        self._store = store
+        self._pump_power = pump_power
+        self._dhw_tank_volume = dhw_tank_volume
+        self._data = {
+            "heating": {"electrical": 0, "thermal": 0},
+            "cooling": {"electrical": 0, "thermal": 0},
+            "dhw": {"electrical": 0, "thermal": 0, "runs": []},
+            "monthly": {"heating": {"electrical": 0, "thermal": 0}, "cooling": {"electrical": 0, "thermal": 0}, "dhw": {"electrical": 0, "thermal": 0}},
+            "yearly": {"heating": {"electrical": 0, "thermal": 0}, "cooling": {"electrical": 0, "thermal": 0}, "dhw": {"electrical": 0, "thermal": 0}},
+            "lifetime": {"heating": {"electrical": 0, "thermal": 0}, "cooling": {"electrical": 0, "thermal": 0}, "dhw": {"electrical": 0, "thermal": 0}},
+        }
+        self._current_dhw_run = None
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=timedelta(seconds=30),
+        )
 
-    def _period_marker(self) -> Optional[str]:
-        now = ha_now()
-        if self.period == "month":
-            return f"{now.year}-{now.month}"
-        if self.period == "year":
-            return str(now.year)
-        return None  # lifetime
+    async def _async_update_data(self):
+        """Update data."""
+        try:
+            # Load persistent data
+            if (data := await self._store.async_load()) is not None:
+                self._data.update(data)
 
-    def _check_reset(self):
-        marker = self._period_marker()
-        if marker and marker != self._last_reset_marker:
-            self._thermal_kwh = 0.0
-            self._electric_kwh = 0.0
-            self._last_reset_marker = marker
+            # Get current sensor values
+            indoor_power = float(self._hass.states.get(SENSOR_INDOOR_POWER).state)
+            outdoor_power = float(self._hass.states.get(SENSOR_OUTDOOR_POWER).state)
+            dhw_heater = self._hass.states.get(SENSOR_DHW_HEATER).state == "on"
+            outlet_temp = float(self._hass.states.get(SENSOR_OUTLET_TEMP).state)
+            inlet_temp = float(self._hass.states.get(SENSOR_INLET_TEMP).state)
+            flow = float(self._hass.states.get(SENSOR_FLOW).state)
+            operation_state = self._hass.states.get(SENSOR_OPERATION_STATE).state
+            dhw_current_temp = float(self._hass.states.get(SENSOR_DHW_CURRENT_TEMP).state)
+            dhw_target_temp = float(self._hass.states.get(SENSOR_DHW_TARGET_TEMP).state)
 
-    def add_energy(self, thermal_kwh: float, electric_kwh: float):
-        self._check_reset()
-        self._thermal_kwh += max(thermal_kwh, 0.0)
-        self._electric_kwh += max(electric_kwh, 0.0)
+            # Determine current mode
+            mode = None
+            if STATE_HEAT_THERMO in operation_state:
+                mode = "heating"
+            elif STATE_HEAT_COOL in operation_state:
+                mode = "cooling"
+            elif STATE_DHW in operation_state:
+                mode = "dhw"
 
-        if self._electric_kwh > 0:
-            self._state = round(self._thermal_kwh / self._electric_kwh, 3)
-        else:
-            self._state = None
+            # DHW run logic
+            if STATE_DHW in operation_state or dhw_heater:
+                if self._current_dhw_run is None:
+                    self._current_dhw_run = {
+                        "start_time": dt_util.now(),
+                        "start_temp": dhw_current_temp,
+                        "electrical": 0,
+                        "thermal": 0,
+                    }
+                # Assign electrical power
+                if mode == "heating":
+                    self._data[mode]["electrical"] += (outdoor_power + self._pump_power) / (60 * 60 * 2)
+                elif mode == "cooling":
+                    self._data[mode]["electrical"] += (outdoor_power + self._pump_power) / (60 * 60 * 2)
+                elif mode == "dhw":
+                    self._data[mode]["electrical"] += outdoor_power / (60 * 60 * 2)
 
-        self.async_write_ha_state()
+                # Elektrisch element always to DHW if heater is on
+                if dhw_heater:
+                    self._data["dhw"]["electrical"] += indoor_power / (60 * 60 * 2)
+
+                # Thermal power for DHW: account for temp changes
+                if self._current_dhw_run is not None:
+                    delta_temp = dhw_current_temp - self._current_dhw_run["start_temp"]
+                    if delta_temp > 0:
+                        self._current_dhw_run["thermal"] += (delta_temp * self._dhw_tank_volume * 4.18) / (60 * 60 * 1000)  # kWh
+                    # End of run: neither DHW mode nor heater is active
+                    if STATE_DHW not in operation_state and not dhw_heater:
+                        self._data["dhw"]["runs"].append(self._current_dhw_run)
+                        self._current_dhw_run = None
+            else:
+                self._current_dhw_run = None
+
+            # Thermal power for heating/cooling
+            if mode == "heating" or mode == "cooling":
+                delta_t = outlet_temp - inlet_temp
+                thermal_power = (delta_t * flow * 4.18) / (60 * 60 * 1000)  # kWh per 30s
+                self._data[mode]["thermal"] += thermal_power
+
+            # Update monthly/yearly/lifetime
+            now = dt_util.now()
+            for period in ["monthly", "yearly", "lifetime"]:
+                if mode in ["heating", "cooling", "dhw"]:
+                    self._data[period][mode]["electrical"] += self._data[mode]["electrical"]
+                    self._data[period][mode]["thermal"] += self._data[mode]["thermal"]
+
+            # Save persistent data
+            await self._store.async_save(self._data)
+
+            return self._data
+        except Exception as err:
+            raise UpdateFailed(f"Error updating COP data: {err}")
+
+class HitachiYutakiCOPSensor(Entity):
+    """Representation of a Hitachi Yutaki COP sensor."""
+
+    def __init__(self, coordinator, mode, period):
+        """Initialize the sensor."""
+        self._coordinator = coordinator
+        self._mode = mode
+        self._period = period
+        self._attr_name = f"Hitachi Yutaki {mode} {period} COP"
+        self._attr_unique_id = f"hitachi_yutaki_{mode.lower()}_{period}_cop"
 
     @property
-    def native_value(self):
-        return self._state
+    def state(self):
+        """Return the state of the sensor."""
+        data = self._coordinator.data
+        if self._period == "realtime":
+            electrical = data[self._mode.lower()]["electrical"]
+            thermal = data[self._mode.lower()]["thermal"]
+        else:
+            electrical = data[self._period][self._mode.lower()]["electrical"]
+            thermal = data[self._period][self._mode.lower()]["thermal"]
+        return round(thermal / electrical, 2) if electrical > 0 else None
 
     @property
     def extra_state_attributes(self):
-        return {
-            "thermal_kwh": round(self._thermal_kwh, 3),
-            "electric_kwh": round(self._electric_kwh, 3),
-            "reset_marker": self._last_reset_marker,
-        }
-
-class RealtimeCopSensor(SensorEntity):
-    """Realtime COP based on power (W)."""
-
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_device_class = SensorDeviceClass.NONE
-    _attr_native_unit_of_measurement = ""
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        name: str,
-        thermal_power_fn,
-        electric_power_fn,
-    ):
-        self.hass = hass
-        self._attr_name = name
-        self._thermal_power_fn = thermal_power_fn
-        self._electric_power_fn = electric_power_fn
-        self._state: Optional[float] = None
-
-    async def async_update(self):
-        thermal_w = self._thermal_power_fn()
-        electric_w = self._electric_power_fn()
-
-        if thermal_w > 0 and electric_w > 0:
-            self._state = round(thermal_w / electric_w, 2)
+        """Return the state attributes."""
+        data = self._coordinator.data
+        if self._period == "realtime":
+            return {
+                "electrical_energy": data[self._mode.lower()]["electrical"],
+                "thermal_energy": data[self._mode.lower()]["thermal"],
+            }
         else:
-            self._state = 0.0
+            return {
+                "electrical_energy": data[self._period][self._mode.lower()]["electrical"],
+                "thermal_energy": data[self._period][self._mode.lower()]["thermal"],
+            }
+
+class HitachiYutakiDHWRunSensor(Entity):
+    """Representation of a Hitachi Yutaki DHW run COP sensor."""
+
+    def __init__(self, coordinator):
+        """Initialize the sensor."""
+        self._coordinator = coordinator
+        self._attr_name = "Hitachi Yutaki DHW Run COP"
+        self._attr_unique_id = "hitachi_yutaki_dhw_run_cop"
 
     @property
-    def native_value(self):
-        return self._state
+    def state(self):
+        """Return the state of the sensor."""
+        if not self._coordinator.data["dhw"]["runs"]:
+            return None
+        last_run = self._coordinator.data["dhw"]["runs"][-1]
+        return round(last_run["thermal"] / last_run["electrical"], 2) if last_run["electrical"] > 0 else None
 
-def calculate_dhw_thermal_power_w(
-    inlet_temp: float,
-    outlet_temp: float,
-    boiler_volume_l: float,
-    last_outlet_temp: Optional[float],
-    delta_seconds: float,
-) -> float:
-    """
-    DHW thermal power based on tank temperature increase.
-    Uses outlet temperature only.
-    """
-
-    if last_outlet_temp is None:
-        return 0.0
-
-    delta_t = outlet_temp - last_outlet_temp
-    if delta_t <= 0:
-        return 0.0
-
-    energy_wh = (
-        boiler_volume_l
-        * WATER_HEAT_CAPACITY_WH_PER_L_K
-        * delta_t
-    )
-
-    return (energy_wh / delta_seconds) * SECONDS_PER_HOUR
-
+    @property
+    def extra_state_attributes(self):
+        """Return the state attributes."""
+        if not self._coordinator.data["dhw"]["runs"]:
+            return {}
+        last_run = self._coordinator.data["dhw"]["runs"][-1]
+        return {
+            "start_time": last_run["start_time"],
+            "start_temp": last_run["start_temp"],
+            "electrical_energy": last_run["electrical"],
+            "thermal_energy": last_run["thermal"],
+        }
