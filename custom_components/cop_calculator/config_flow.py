@@ -1,16 +1,6 @@
 from homeassistant import config_entries
 import voluptuous as vol
-
-from .const import (
-    DOMAIN,
-    CONF_LANGUAGE,
-    CONF_DHW_VOLUME,
-    CONF_HEATER_OFFSET,
-    DEFAULT_LANGUAGE,
-    DEFAULT_DHW_VOLUME,
-    DEFAULT_HEATER_OFFSET,
-)
-
+from .const import DOMAIN
 
 class COPCalculatorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
@@ -22,18 +12,19 @@ class COPCalculatorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 data=user_input,
             )
 
-        schema = vol.Schema(
-            {
-                vol.Optional(CONF_LANGUAGE, default=DEFAULT_LANGUAGE): vol.In(
-                    ["en", "nl"]
-                ),
-                vol.Optional(
-                    CONF_DHW_VOLUME, default=DEFAULT_DHW_VOLUME
-                ): vol.Coerce(float),
-                vol.Optional(
-                    CONF_HEATER_OFFSET, default=DEFAULT_HEATER_OFFSET
-                ): vol.Coerce(float),
-            }
-        )
+        schema = vol.Schema({
+            vol.Optional(
+                "language",
+                default="en"
+            ): vol.In(["en", "nl"]),
 
-        return self.async_show_form(step_id="user", data_schema=schema)
+            vol.Optional(
+                "circulation_pump_power",
+                default=59
+            ): vol.Coerce(int),
+        })
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=schema,
+        )
