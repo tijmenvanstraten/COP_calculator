@@ -1,4 +1,4 @@
-DOMAIN = "hitachi_yutaki_cop"
+DOMAIN = "cop_calculator"
 
 # Sensor names
 SENSOR_INDOOR_POWER = "sensor.shelly_warmtepomp_binnenunit_active_power"
@@ -13,7 +13,7 @@ SENSOR_DHW_TARGET_TEMP = "sensor.dhw_temperatuur_set_corrected"
 
 # Operation states
 STATE_HEAT_THERMO = "operation_state_heat_thermo_on"
-STATE_HEAT_COOL = "operation_state_heat_cool_on"
+STATE_HEAT_COOL = "operation_state_cool_thermo_on"
 STATE_DHW = "operation_state_dhw_on"
 
 # Default values
