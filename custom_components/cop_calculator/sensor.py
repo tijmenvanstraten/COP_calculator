@@ -82,16 +82,15 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
             if (data := await self._store.async_load()) is not None:
                 self._data.update(data)
 
-            # --- Ensure baseline keys exist ---
-            for key in ["heating","cooling","dhw"]:
-                self._data[key] = {
-                    "power": self._data.get(key, {}).get("power", {"electrical":0,"thermal":0}),
-                    "energy": self._data.get(key, {}).get("energy", {"electrical":0,"thermal":0}),
-                    "runs": self._data.get(key, {}).get("runs", [] if key=="dhw" else None),
-                    "last_energy_thermal": self._data.get(key, {}).get("last_energy_thermal", 0),
-                    "last_energy_electrical": self._data.get(key, {}).get("last_energy_electrical", 0)
-                }
-
+            # --- Ensure baseline keys exist (non-destructive) ---
+            for key in ["heating", "cooling", "dhw"]:
+                self._data.setdefault(key, {})
+                self._data[key].setdefault("power", {"electrical": 0, "thermal": 0})
+                self._data[key].setdefault("energy", {"electrical": 0, "thermal": 0})
+                self._data[key].setdefault("runs", [] if key == "dhw" else None)
+                self._data[key].setdefault("last_energy_thermal", 0)
+                self._data[key].setdefault("last_energy_electrical", 0)
+ 
             for period in ["monthly", "yearly", "lifetime"]:
                 self._data.setdefault(period, {})
                 for key in ["heating", "cooling", "dhw"]:
