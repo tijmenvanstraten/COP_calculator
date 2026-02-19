@@ -5,7 +5,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.storage import Store
 from homeassistant.const import CONF_NAME
 from homeassistant.util import dt as dt_util
-from homeassistant.components.sensor import SensorStateClass
+from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from datetime import timedelta
 import json
 from .const import (
@@ -270,7 +270,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     # First refresh as background rask 
     hass.async_create_task(coordinator.async_config_entry_first_refresh())
 
-class HitachiYutakiCOPSensor(CoordinatorEntity, Entity):
+class HitachiYutakiCOPSensor(CoordinatorEntity, SensorEntity):
     """Representation of a Hitachi Yutaki COP sensor."""
 
     def __init__(self, coordinator, mode, period):
@@ -315,7 +315,7 @@ class HitachiYutakiCOPSensor(CoordinatorEntity, Entity):
                 "thermal_energy": data.get(self._period, {}).get(self._mode, {}).get("energy", {}).get("thermal", 0),
             }
 
-class HitachiYutakiDHWRunSensor(CoordinatorEntity, Entity):
+class HitachiYutakiDHWRunSensor(CoordinatorEntity, SensorEntity):
     """Representation of a Hitachi Yutaki DHW run COP sensor."""
 
     def __init__(self, coordinator):
