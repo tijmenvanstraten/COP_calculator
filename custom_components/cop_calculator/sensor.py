@@ -5,6 +5,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.storage import Store
 from homeassistant.const import CONF_NAME
 from homeassistant.util import dt as dt_util
+from homeassistant.components.sensor import SensorStateClass
 from datetime import timedelta
 import json
 from .const import (
@@ -138,9 +139,16 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
 
             # --- Realtime COP for heating/cooling ---
             if mode in ["heating", "cooling"]:
-                delta_t = outlet_temp - inlet_temp
-                flow_kg_s = flow * 1000 / 3600  # m3/h -> kg/s
-                thermal_power_w = abs(flow_kg_s * 4180 * delta_t)  # W = m_dot * Cp * dT
+                flow_kg_s = flow * 1000 / 3600  # m3/h → kg/s
+
+                if mode == "heating":
+                    delta_t = outlet_temp - inlet_temp
+                    thermal_power_w = flow_kg_s * 4180 * delta_t if delta_t > 0 else 0
+
+                else:  # cooling
+                    delta_t = inlet_temp - outlet_temp
+                    thermal_power_w = flow_kg_s * 4180 * delta_t if delta_t > 0 else 0
+
                 electrical_power_w = outdoor_power + self._pump_power
 
                 self._data[mode]["power"]["thermal"] = thermal_power_w
@@ -273,7 +281,8 @@ class HitachiYutakiCOPSensor(CoordinatorEntity, Entity):
         self._period = period.lower()
         self._attr_name = f"Hitachi Yutaki {mode} {period} COP"
         self._attr_unique_id = f"hitachi_yutaki_{mode.lower()}_{period}_cop"
-        self._attr_state_class = "measurement"
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_unit_of_measurement = None
         
     @property
     def state(self):
@@ -315,7 +324,8 @@ class HitachiYutakiDHWRunSensor(CoordinatorEntity, Entity):
         self._coordinator = coordinator
         self._attr_name = "Hitachi Yutaki DHW Run COP"
         self._attr_unique_id = "hitachi_yutaki_dhw_run_cop"
-        self._attr_state_class = "measurement"
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_unit_of_measurement = None
 
     @property
     def state(self):
