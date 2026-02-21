@@ -162,9 +162,11 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
                     self._data[mode]["energy"]["electrical"] += electrical_power_w * interval_h / 1000
                 
             # --- DHW-run logic ---
-            elif mode == "dhw" or dhw_heater:
+            dhw_active = (mode == "dhw") or dhw_heater
+            
+            if dhw_active:
                 if self._current_dhw_run is None and dhw_current_temp is not None:
-                    # Start nieuwe DHW-run
+                    # Start new DHW-run
                     self._current_dhw_run = {
                         "start_time": dt_util.now(),
                         "start_temp": dhw_current_temp,
@@ -175,27 +177,27 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
                     }
 
             if self._current_dhw_run is not None and dhw_current_temp is not None:
-                # Bereken verandering t.o.v. vorige temp
+                # Calculate change since last temp
                 delta_temp = dhw_current_temp - self._current_dhw_run["last_temp"]
                 
-                # registreer dalingen
+                # register temp drops
                 if delta_temp < 0:
                     self._current_dhw_run["sum_of_drops"] += abs(delta_temp)
 
-                # update laatste gemeten temp
+                # update last measured temp
                 self._current_dhw_run["last_temp"] = dhw_current_temp
 
-                # Elektrical energy tijdens run
+                # Elektrical energy during run
                 dhw_electric = 0
                 interval_hours = self.update_interval.total_seconds() / 3600
                 if dhw_heater and indoor_power is not None:
-                    dhw_electric += indoor_power * interval_hours  # kWh
+                    dhw_electric += (indoor_power - self._pump_power) * interval_hours  # kWh
                 if mode == "dhw" and outdoor_power is not None:
-                    dhw_electric += outdoor_power * interval_hours  # kWh
+                    dhw_electric += (outdoor_power + self._pump_power) * interval_hours  # kWh
                 self._current_dhw_run["electrical"] += dhw_electric
                 
             # --- End DHW-run ---
-            if self._current_dhw_run is not None and mode != "dhw" and not dhw_heater:
+            if self._current_dhw_run is not None and not dhw_active:
                 start_temp = self._current_dhw_run["start_temp"]
                 end_temp = self._current_dhw_run["last_temp"]
                 thermal_delta_temp = (end_temp - start_temp) + self._current_dhw_run["sum_of_drops"]
