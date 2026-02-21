@@ -110,20 +110,6 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
             dhw_current_temp = _get_state_float(self._hass, SENSOR_DHW_CURRENT_TEMP)
             dhw_target_temp = _get_state_float(self._hass, SENSOR_DHW_TARGET_TEMP)
 
-            # --- Check input sensors ---
-            critical = [
-                indoor_power, outdoor_power, outlet_temp, inlet_temp,
-                flow, dhw_current_temp, dhw_target_temp, operation_state
-            ]
-            if any(v is None for v in critical):
-                _LOGGER.debug("COP calculator: input sensor(s) niet beschikbaar, update skipped")
-                return self._data
-
-            # --- Debug logging ---
-            _LOGGER.debug(f"Sensor values - indoor_power: {indoor_power}, outdoor_power: {outdoor_power}, "
-                          f"outlet_temp: {outlet_temp}, inlet_temp: {inlet_temp}, flow: {flow}, "
-                          f"operation_state: {operation_state}, dhw_heater: {dhw_heater}")
-                          
             # --- Determine current mode ---
             mode = None
             if STATE_HEAT_THERMO in operation_state:
@@ -134,7 +120,23 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
                 mode = "dhw"
 
             if mode is None:
+                return self._data 
+                
+            # --- Check input sensors ---
+            if mode in ["heating", "cooling"]:
+                critical = [outdoor_power, outlet_temp, inlet_temp, flow, operation_state]
+            else:  # dhw
+                critical = [indoor_power, outdoor_power, dhw_current_temp, operation_state]
+            
+            if any(v is None for v in critical):
+                _LOGGER.debug("COP calculator: input sensor(s) niet beschikbaar, update skipped")
                 return self._data
+
+            # --- Debug logging ---
+            _LOGGER.debug(f"Sensor values - indoor_power: {indoor_power}, outdoor_power: {outdoor_power}, "
+                          f"outlet_temp: {outlet_temp}, inlet_temp: {inlet_temp}, flow: {flow}, "
+                          f"operation_state: {operation_state}, dhw_heater: {dhw_heater}")
+
 
             # --- Realtime COP for heating/cooling ---
             if mode in ["heating", "cooling"]:
@@ -155,9 +157,10 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
 
                 # cumulative energy (kWh)
                 interval_h = self.update_interval.total_seconds() / 3600
-                self._data[mode]["energy"]["thermal"] += thermal_power_w * interval_h / 1000
-                self._data[mode]["energy"]["electrical"] += electrical_power_w * interval_h / 1000
-            
+                if thermal_power_w > 0:
+                    self._data[mode]["energy"]["thermal"] += thermal_power_w * interval_h / 1000
+                    self._data[mode]["energy"]["electrical"] += electrical_power_w * interval_h / 1000
+                
             # --- DHW-run logic ---
             elif mode == "dhw" or dhw_heater:
                 if self._current_dhw_run is None and dhw_current_temp is not None:
@@ -220,22 +223,19 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
                 self._current_dhw_run = None
 
             # --- Update period COP values using delta ---
-            for key in ["heating", "cooling", "dhw"]:
-                self._data[key].setdefault("last_energy_thermal", 0)
-                self._data[key].setdefault("last_energy_electrical", 0)
-
-            for period in ["monthly","yearly","lifetime"]:
+            for period in ["monthly", "yearly", "lifetime"]:
                 if mode in ["heating", "cooling"]:
                     thermal_delta = self._data[mode]["energy"]["thermal"] - self._data[mode]["last_energy_thermal"]
                     electrical_delta = self._data[mode]["energy"]["electrical"] - self._data[mode]["last_energy_electrical"]
 
                     self._data[period][mode]["energy"]["thermal"] += thermal_delta
                     self._data[period][mode]["energy"]["electrical"] += electrical_delta
-    
+
             # --- Save last cumulative values ---
-            self._data[mode]["last_energy_thermal"] = self._data[mode]["energy"]["thermal"]
-            self._data[mode]["last_energy_electrical"] = self._data[mode]["energy"]["electrical"]
-        
+            if mode in ["heating", "cooling"]:
+                self._data[mode]["last_energy_thermal"] = self._data[mode]["energy"]["thermal"]
+                self._data[mode]["last_energy_electrical"] = self._data[mode]["energy"]["electrical"]
+
             # Save persistent data
             await self._store.async_save(self._data)
             return self._data
