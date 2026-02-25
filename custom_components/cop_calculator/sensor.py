@@ -81,7 +81,7 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
             # Persistent data
             if (data := await self._store.async_load()) is not None:
                 self._data.update(data)
-
+            
             # --- Ensure baseline keys exist (non-destructive) ---
             for key in ["heating", "cooling", "dhw"]:
                 self._data.setdefault(key, {})
@@ -119,25 +119,9 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
             elif STATE_DHW in operation_state:
                 mode = "dhw"
 
-            if mode is None:
+            if mode is None and not dhw_heater:
                 return self._data 
                 
-            # --- Check input sensors ---
-            if mode in ["heating", "cooling"]:
-                critical = [outdoor_power, outlet_temp, inlet_temp, flow, operation_state]
-            else:  # dhw
-                critical = [indoor_power, outdoor_power, dhw_current_temp, operation_state]
-            
-            if any(v is None for v in critical):
-                _LOGGER.debug("COP calculator: input sensor(s) niet beschikbaar, update skipped")
-                return self._data
-
-            # --- Debug logging ---
-            _LOGGER.debug(f"Sensor values - indoor_power: {indoor_power}, outdoor_power: {outdoor_power}, "
-                          f"outlet_temp: {outlet_temp}, inlet_temp: {inlet_temp}, flow: {flow}, "
-                          f"operation_state: {operation_state}, dhw_heater: {dhw_heater}")
-
-
             # --- Realtime COP for heating/cooling ---
             if mode in ["heating", "cooling"]:
                 flow_kg_s = flow * 1000 / 3600  # m3/h → kg/s
@@ -191,9 +175,9 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
                 dhw_electric = 0
                 interval_hours = self.update_interval.total_seconds() / 3600
                 if dhw_heater and indoor_power is not None:
-                    dhw_electric += (indoor_power - self._pump_power) * interval_hours  # kWh
+                    dhw_electric += (indoor_power - self._pump_power) * interval_hours / 1000 # kWh
                 if mode == "dhw" and outdoor_power is not None:
-                    dhw_electric += (outdoor_power + self._pump_power) * interval_hours  # kWh
+                    dhw_electric += (outdoor_power + self._pump_power) * interval_hours / 1000 # kWh
                 self._current_dhw_run["electrical"] += dhw_electric
                 
             # --- End DHW-run ---
