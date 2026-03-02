@@ -63,10 +63,16 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
             self._data[key].setdefault("last_energy_electrical", 0)
 
 
-        for period in ["monthly", "yearly", "lifetime"]:
+        for period in ["daily", "monthly", "yearly", "lifetime"]:
             self._data[period] = {}
             for key in ["heating", "cooling", "dhw"]:
                 self._data[period][key] = {"energy": {"electrical": 0, "thermal": 0}}
+        
+        # calender tracking
+        self._data.setdefault("calendar", {})
+        self._data["calendar"].setdefault("last_day", None)
+        self._data["calendar"].setdefault("last_month", None)
+        self._data["calendar"].setdefault("last_year", None)
 
         super().__init__(
             hass,
@@ -81,7 +87,46 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
             # Persistent data
             if (data := await self._store.async_load()) is not None:
                 self._data.update(data)
+                
+            reset_done = False
             
+            # --- Kalender reset logic ---
+            now = dt_util.now()
+            current_month = f"{now.year}-{now.month:02d}"
+            current_year = str(now.year)
+            current_day = now.date().isoformat()  # YYYY-MM-DD
+            
+            last_day = self._data["calendar"].get("last_day")
+            last_month = self._data["calendar"].get("last_month")
+            last_year = self._data["calendar"].get("last_year")
+
+            # day reset
+            if last_day != current_day:
+                for mode in ["heating", "cooling", "dhw"]:
+                    self._data["daily"][mode]["energy"]["thermal"] = 0
+                    self._data["daily"][mode]["energy"]["electrical"] = 0
+                self._data["calendar"]["last_day"] = current_day
+                reset_done = True
+                _LOGGER.info("Daily COP counters reset (%s)", current_day)
+            
+            # month reset
+            if last_month != current_month:
+                for mode in ["heating", "cooling", "dhw"]:
+                    self._data["monthly"][mode]["energy"]["thermal"] = 0
+                    self._data["monthly"][mode]["energy"]["electrical"] = 0
+                self._data["calendar"]["last_month"] = current_month
+                reset_done = True
+                _LOGGER.info("Monthly COP counters reset (%s)", current_month)
+
+            # year reset
+            if last_year != current_year:
+                for mode in ["heating", "cooling", "dhw"]:
+                    self._data["yearly"][mode]["energy"]["thermal"] = 0
+                    self._data["yearly"][mode]["energy"]["electrical"] = 0
+                self._data["calendar"]["last_year"] = current_year
+                reset_done = True
+                _LOGGER.info("Yearly COP counters reset (%s)", current_year)
+    
             # --- Ensure baseline keys exist (non-destructive) ---
             for key in ["heating", "cooling", "dhw"]:
                 self._data.setdefault(key, {})
@@ -91,7 +136,7 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
                 self._data[key].setdefault("last_energy_thermal", 0)
                 self._data[key].setdefault("last_energy_electrical", 0)
  
-            for period in ["monthly", "yearly", "lifetime"]:
+            for period in ["daily", "monthly", "yearly", "lifetime"]:
                 self._data.setdefault(period, {})
                 for key in ["heating", "cooling", "dhw"]:
                     self._data[period].setdefault(key, {})
@@ -118,10 +163,17 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
                 mode = "cooling"
             elif STATE_DHW in operation_state:
                 mode = "dhw"
+            
+            if (
+                mode is None
+                and not dhw_heater
+                and self._current_dhw_run is None
+            ):
+                if reset_done:
+                    await self._store.async_save(self._data)
+                    _LOGGER.info("Calendar reset saved at midnight without activity")
+                return self._data
 
-            if mode is None and not dhw_heater:
-                return self._data 
-                
             # --- Realtime COP for heating/cooling ---
             if mode in ["heating", "cooling"]:
                 flow_kg_s = flow * 1000 / 3600  # m3/h → kg/s
@@ -194,7 +246,7 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
                 self._data["dhw"]["energy"]["electrical"] += electrical_increment
 
                 # --- update period energies (exact once per run) ---
-                for period in ["monthly", "yearly", "lifetime"]:
+                for period in ["daily", "monthly", "yearly", "lifetime"]:
                     self._data[period]["dhw"]["energy"]["thermal"] += thermal_increment
                     self._data[period]["dhw"]["energy"]["electrical"] += electrical_increment
 
@@ -209,7 +261,7 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
                 self._current_dhw_run = None
 
             # --- Update period COP values using delta ---
-            for period in ["monthly", "yearly", "lifetime"]:
+            for period in ["daily", "monthly", "yearly", "lifetime"]:
                 if mode in ["heating", "cooling"]:
                     thermal_delta = self._data[mode]["energy"]["thermal"] - self._data[mode]["last_energy_thermal"]
                     electrical_delta = self._data[mode]["energy"]["electrical"] - self._data[mode]["last_energy_electrical"]
@@ -247,7 +299,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
         HitachiYutakiDHWRunSensor(coordinator),
     ]
     for mode in ["Heating", "Cooling", "DHW"]:
-        for period in ["Monthly", "Yearly", "Lifetime"]:
+        for period in ["Daily", "Monthly", "Yearly", "Lifetime"]:
             sensors.append(HitachiYutakiCOPSensor(coordinator, mode, period.lower()))
 
     async_add_entities(sensors, True)
