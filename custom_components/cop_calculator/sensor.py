@@ -238,8 +238,12 @@ class HitachiYutakiCOPDataUpdateCoordinator(DataUpdateCoordinator):
                 end_temp = self._current_dhw_run["last_temp"]
                 thermal_delta_temp = (end_temp - start_temp) + self._current_dhw_run["sum_of_drops"]
             
-                thermal_increment = thermal_delta_temp * self._dhw_tank_volume * 4180 / 3600000  # kWh
                 electrical_increment = self._current_dhw_run["electrical"]
+                
+                if dhw_heater:  # elektrical element
+                    thermal_increment = electrical_increment
+                else:  # compressor
+                    thermal_increment = thermal_delta_temp * self._dhw_tank_volume * 4180 / 3600000  # kWh
                 
                 # --- update total DHW energy ---
                 self._data["dhw"]["energy"]["thermal"] += thermal_increment
