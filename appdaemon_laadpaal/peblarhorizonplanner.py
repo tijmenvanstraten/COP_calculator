@@ -93,6 +93,7 @@ class PeblarHorizonPlanner(hass.Hass):
         self._forecast_alarm_sent = False
         self._wacht_op_forecast = False
         self._tarief_meta = {}
+        self._gelogde_meldingen = {}
 
         # Laad persistente data
         self._load_persistent_data()
@@ -206,6 +207,16 @@ class PeblarHorizonPlanner(hass.Hass):
                 self.log("Energie core forecast geupdate, herbereken planning...")
                 self.bereken_laadplan()
 
+    def _log_bij_verandering(self, sleutel: str, melding: Optional[str]):
+        vorige = self._gelogde_meldingen.get(sleutel)
+        if melding:
+            if melding != vorige:
+                self.warning(melding)
+            self._gelogde_meldingen[sleutel] = melding
+        elif vorige is not None:
+            self.log(f"Melding opgelost: {vorige}")
+            self._gelogde_meldingen.pop(sleutel, None)
+
     def _parse_iso_to_utc(self, value: Any) -> datetime.datetime:
         if isinstance(value, datetime.datetime):
             dt = value
@@ -250,8 +261,13 @@ class PeblarHorizonPlanner(hass.Hass):
             return None
         self._forecast_alarm_sent = False
 
-        if attrs.get("status") == "degraded":
-            self.warning(f"Forecast status 'degraded': {attrs.get('waarschuwingen')}")
+        self._forecast_status = attrs.get("status")
+        if self._forecast_status == "degraded":
+            self._log_bij_verandering("forecast_status",
+                                      f"Forecast status 'degraded': {attrs.get('waarschuwingen')}")
+        else:
+            self._log_bij_verandering("forecast_status", None)
+
         tarief = attrs.get("tarief")
         self._tarief_meta = dict(tarief) if isinstance(tarief, dict) else {}
 
@@ -606,7 +622,20 @@ class PeblarHorizonPlanner(hass.Hass):
                     slot_start = slot_end
 
                 if ontbrekend > 0:
-                    self.warning(f"{ontbrekend} kwartier(en) niet in forecast, fallbackwaarden gebruikt.")
+                    self._log_bij_verandering("forecast_ontbreekt",
+                                              f"{ontbrekend} kwartier(en) niet in forecast, fallbackwaarden gebruikt.")
+                else:
+                    self._log_bij_verandering("forecast_ontbreekt", None)
+
+                fallback_kwartieren = [u for u in self.matrix_kwartieren if u["prijs_bron"] == "fallback"]
+                if fallback_kwartieren:
+                    eerste_fallback = fallback_kwartieren[0]["tijd"].astimezone(self._local_tz).strftime("%d-%m %H:%M")
+                    self._log_bij_verandering(
+                        "fallback_prijzen",
+                        f"{len(fallback_kwartieren)} van {len(self.matrix_kwartieren)} kwartieren tot vertrektijd gebruiken "
+                        f"een fallbackprijs (eerste: {eerste_fallback}). De planning is daar minder betrouwbaar.")
+                else:
+                    self._log_bij_verandering("fallback_prijzen", None)
 
                 # Plan zonladen en netladen
                 if netto_behoefte_kwh > self.TOLERANCE:
@@ -881,11 +910,14 @@ class PeblarHorizonPlanner(hass.Hass):
                 "huis_verbruik": [],
                 "laadplanning_zon": [],
                 "laadplanning_net": [],
+                "prijs_bron": [],
                 "metadata": {
                     "energiebelasting": self._tarief_meta.get("energiebelasting"),
                     "leverancierskosten": self._tarief_meta.get("leverancierskosten"),
                     "btw": self._tarief_meta.get("btw"),
                     "laadrendement": self.LAADRENDEMENT,
+                    "forecast_status": getattr(self, "_forecast_status", None),
+                    "fallback_prijs_kwartieren": sum(1 for u in self.matrix_kwartieren if u["prijs_bron"] == "fallback"),
                 }
             }
             for u in self.matrix_kwartieren:
@@ -895,6 +927,7 @@ class PeblarHorizonPlanner(hass.Hass):
                 graph_data["totaal_tarieven"].append(round(u["net_prijs"], 4))
                 graph_data["zon_opwek"].append(round(u["laadbare_zon_kwh"], 2))
                 graph_data["huis_verbruik"].append(round(u["verbruik_kw"], 2))
+                graph_data["prijs_bron"].append(u["prijs_bron"])
                 plan_entry = self.plan.get(u["tijd"], {"zon_kwh": 0.0, "net_kwh": 0.0})
                 graph_data["laadplanning_zon"].append(round(plan_entry.get("zon_kwh", 0.0), 2))
                 graph_data["laadplanning_net"].append(round(plan_entry.get("net_kwh", 0.0), 2))

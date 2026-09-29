@@ -254,6 +254,8 @@ class EnergieCorePredictor(hass.Hass):
             waarden_alle: Dict[Tuple, List[float]] = {}
             waarden_type: Dict[Tuple, List[float]] = {}
             dagen_type: Dict[Tuple, Set[datetime.date]] = {}
+            totaal_metingen = 0
+            uitgesloten = 0
             for s in records:
                 try:
                     ts = self._extract_timestamp(s)
@@ -263,6 +265,10 @@ class EnergieCorePredictor(hass.Hass):
                     if val != val:
                         continue
                     val = max(0.0, val)
+                    totaal_metingen += 1
+                    if val > self.MAX_REALISTISCH_VERBRUIK_KW:
+                        uitgesloten += 1
+                        continue
                     lokaal = ts.astimezone(self._local_tz)
                     blok = (lokaal.hour, lokaal.minute // self.QUARTER_MINUTES)
                     type_key = (self._dagtype(lokaal),) + blok
@@ -271,6 +277,19 @@ class EnergieCorePredictor(hass.Hass):
                     dagen_type.setdefault(type_key, set()).add(lokaal.date())
                 except (ValueError, KeyError, TypeError):
                     continue
+
+            # Onrealistische metingen zijn uitgesloten; kwartieren zonder geldige metingen vallen terug op fallback
+            self._historie_waarschuwing = None
+            if uitgesloten > 0:
+                aandeel = uitgesloten / totaal_metingen
+                if aandeel > 0.05 or not waarden_alle:
+                    self._historie_waarschuwing = (
+                        f"{uitgesloten} van {totaal_metingen} verbruiksmetingen ({aandeel * 100:.0f}%) boven "
+                        f"{self.MAX_REALISTISCH_VERBRUIK_KW:.0f} kW uitgesloten. "
+                        f"Controleer verbruik_eenheid (nu: {self._verbruik_eenheid_gebruikt}).")
+                else:
+                    self.log(f"{uitgesloten} onrealistische verbruiksmetingen (> {self.MAX_REALISTISCH_VERBRUIK_KW:.0f} kW) "
+                             f"uitgesloten van de historie.")
 
             if not waarden_alle:
                 self.warning("Verbruikshistorie bevat geen bruikbare waarden, gebruik fallback.")
@@ -283,14 +302,6 @@ class EnergieCorePredictor(hass.Hass):
             for type_key, vals in waarden_type.items():
                 if len(dagen_type.get(type_key, set())) >= self.HISTORY_MIN_DAGEN:
                     nieuwe_cache[type_key] = max(self.MIN_VERBRUIK_KW, sum(vals) / len(vals))
-
-            hoogste = max(nieuwe_cache.values())
-            if hoogste > self.MAX_REALISTISCH_VERBRUIK_KW:
-                self._historie_waarschuwing = (
-                    f"Verbruikshistorie bevat onwaarschijnlijk hoge waarden ({hoogste:.1f} kW). "
-                    f"Controleer verbruik_eenheid (nu: {self._verbruik_eenheid_gebruikt}).")
-            else:
-                self._historie_waarschuwing = None
 
             self.db_cache = nieuwe_cache
             self.db_cache_loaded_at = nu
