@@ -1,0 +1,3 @@
+cop_calculator:
+  module: cop_calculator
+  class: COPCalculator
