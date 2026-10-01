@@ -70,6 +70,7 @@ class EnergieCorePredictor(hass.Hass):
     DEFAULT_ENTITIES = {
         "solcast_today_entity": "sensor.solcast_pv_forecast_forecast_today",
         "solcast_tomorrow_entity": "sensor.solcast_pv_forecast_forecast_tomorrow",
+        "nordpool_prijs_entity": "sensor.nordpool_huidige_kwartierprijs_nl",
         "epex_prijs_entity": "sensor.epex_price_prediction",
         "forecast_entity": "sensor.energie_core_forecast",
     }
@@ -108,7 +109,7 @@ class EnergieCorePredictor(hass.Hass):
         self._debounce_timer = None
 
         # Bronnen die de forecast kunnen verversen (ook attribuutwijzigingen)
-        for entity in self.solcast_entities + [self.epex_prijs_entity]:
+        for entity in self.solcast_entities + [self.nordpool_prijs_entity, self.epex_prijs_entity]:
             self.listen_state(self._bron_gewijzigd, entity, attribute="all")
 
         self._schedule_kwartier_timer()
@@ -163,7 +164,8 @@ class EnergieCorePredictor(hass.Hass):
         self._historie_taak_indien_nodig(self.HISTORY_START_DELAY_SECONDS)
 
     def _controleer_entiteiten(self):
-        for entity in self.verbruik_plus_entities + self.verbruik_min_entities + self.solcast_entities + [self.epex_prijs_entity]:
+        for entity in (self.verbruik_plus_entities + self.verbruik_min_entities + self.solcast_entities
+                   + [self.nordpool_prijs_entity, self.epex_prijs_entity]):
             try:
                 if self.get_state(entity) is None:
                     self.warning(f"Entiteit {entity} bestaat niet (controleer apps.yaml).")
@@ -569,18 +571,47 @@ class EnergieCorePredictor(hass.Hass):
         if not self.forecast_dict:
             waarschuwingen.append("Solcast bevat geen bruikbare periodes, PV = 0.")
 
-    # ===== EPEX (EpexPredictor REST-sensor: attributen s = unix-tijden, t = prijzen) =====
+    # ===== PRIJZEN (Nordpool primair, EpexPredictor voor ontbrekende kwartieren) =====
     def _build_prijs_dict(self, waarschuwingen: List[str]):
         self.prijs_dict = {}
+        self.prijs_bron_dict: Dict[datetime.datetime, str] = {}
+
+        nordpool = self.get_state(self.nordpool_prijs_entity, attribute="all")
+        nordpool_attrs = (nordpool.get("attributes", {}) or {}) if nordpool else {}
+        nordpool_prijzen = []
+        for key in ("prices_today", "prices_tomorrow", "Prices today", "Prices tomorrow",
+                    "raw_today", "raw_tomorrow", "today", "tomorrow"):
+            waarden = nordpool_attrs.get(key, [])
+            if isinstance(waarden, list):
+                nordpool_prijzen.extend(waarden)
+
+        nordpool_ongeldig = 0
+        for item in nordpool_prijzen:
+            try:
+                start = self._floor_kwartier(self._parse_iso_to_utc(item["start"]))
+                einde = self._parse_iso_to_utc(item["end"]) if item.get("end") else start + datetime.timedelta(minutes=15)
+                prijs = float(item.get("price", item.get("value"))) * self.EPEX_UNIT_MULTIPLIER
+                aantal_kwartieren = max(1, int((einde - start).total_seconds() // 900))
+                for k in range(aantal_kwartieren):
+                    slot = start + datetime.timedelta(minutes=k * self.QUARTER_MINUTES)
+                    self.prijs_dict[slot] = prijs
+                    self.prijs_bron_dict[slot] = "nordpool"
+            except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as e:
+                nordpool_ongeldig += 1
+                if self.DEBUG_LOGGING:
+                    self.log(f"[DEBUG] Ongeldige Nordpool prijs: {self._sanitize_error(e)}")
+        if nordpool_ongeldig:
+            waarschuwingen.append("Nordpool-prijzen met ongeldige data overgeslagen.")
+
         p = self.get_state(self.epex_prijs_entity, attribute="all")
         if not p:
-            waarschuwingen.append("Geen EPEX prijzen beschikbaar, fallbackprijs gebruikt.")
+            waarschuwingen.append("Geen EPEX Predictor-prijzen beschikbaar; Nordpool wordt gebruikt waar beschikbaar.")
             return
         attrs = p.get("attributes", {}) or {}
         s_lijst = attrs.get("s")
         t_lijst = attrs.get("t")
         if not isinstance(s_lijst, list) or not isinstance(t_lijst, list) or not s_lijst or len(s_lijst) != len(t_lijst):
-            waarschuwingen.append("EPEX-sensor mist geldige attributen 's' en 't', fallbackprijs gebruikt.")
+            waarschuwingen.append("EPEX Predictor mist geldige attributen 's' en 't'; Nordpool wordt gebruikt waar beschikbaar.")
             return
         ongeldig = 0
         vorige_duur = 900.0
@@ -601,15 +632,18 @@ class EnergieCorePredictor(hass.Hass):
                     prijs = self._totaal_naar_epex(prijs)
                 start = self._floor_kwartier(datetime.datetime.fromtimestamp(start_ts, tz.UTC))
                 for k in range(aantal_kwartieren):
-                    self.prijs_dict[start + datetime.timedelta(minutes=k * self.QUARTER_MINUTES)] = prijs
+                    slot = start + datetime.timedelta(minutes=k * self.QUARTER_MINUTES)
+                    if slot not in self.prijs_dict:
+                        self.prijs_dict[slot] = prijs
+                        self.prijs_bron_dict[slot] = "epex"
             except (ValueError, TypeError, OverflowError, OSError) as e:
                 ongeldig += 1
                 if self.DEBUG_LOGGING:
                     self.log(f"[DEBUG] Ongeldige EPEX prijs: {self._sanitize_error(e)}")
         if ongeldig:
-            waarschuwingen.append("EPEX-prijzen met ongeldige data overgeslagen.")
+            waarschuwingen.append("EPEX Predictor-prijzen met ongeldige data overgeslagen.")
         if not self.prijs_dict:
-            waarschuwingen.append("EPEX bevat geen bruikbare prijzen, fallbackprijs gebruikt.")
+            waarschuwingen.append("Geen bruikbare Nordpool- of EPEX Predictor-prijzen; fallbackprijs gebruikt.")
 
     # ===== WAARSCHUWINGEN (ALLEEN LOGGEN BIJ VERANDERING) =====
     def _log_waarschuwingen_bij_verandering(self, waarschuwingen: List[str]):
@@ -655,7 +689,7 @@ class EnergieCorePredictor(hass.Hass):
                         prijs_bron = "fallback"
                         fallback_slots += 1
                     else:
-                        prijs_bron = "epex"
+                        prijs_bron = self.prijs_bron_dict.get(slot, "epex")
                         laatste_prijs_slot = slot
                     matrix.append({
                         "tijd": slot.isoformat(),
