@@ -29,8 +29,8 @@ class EnergieCorePredictor(hass.Hass):
     DEBUG_LOGGING = False
 
     # Belastingen (2026)
-    ENERGIEBELASTING_PER_KWH = 0.15
-    LEVERANCIERSKOSTEN_PER_KWH = 0.03
+    ENERGIEBELASTING_PER_KWH = 0.09161
+    LEVERANCIERSKOSTEN_PER_KWH = 0.0205
     BTW_PERCENTAGE = 21.0
 
     # EpexPredictor: True als de REST-sensor al belasting en btw bevat (via surcharge/taxPercent).
