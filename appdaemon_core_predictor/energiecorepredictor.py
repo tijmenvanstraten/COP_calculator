@@ -2,6 +2,7 @@ import hassapi as hass
 import datetime
 import threading
 import time
+import math
 from typing import Dict, List, Optional, Any, Tuple, Set
 from dateutil import tz
 
@@ -35,6 +36,7 @@ class EnergieCorePredictor(hass.Hass):
     # EpexPredictor: True als de REST-sensor al belasting en btw bevat (via surcharge/taxPercent).
     # Zet dit op False en gebruik surcharge=0 en taxPercent=0 in de REST-URL om dubbel tellen te voorkomen.
     EPEX_PRIJS_IS_TOTAAL = False
+    NORDPOOL_UNIT_MULTIPLIER = 1.0
 
     # Solcast: True = pv_estimate is gemiddeld vermogen in kW per periode van 30 minuten.
     # False = pv_estimate is kWh per periode van 30 minuten.
@@ -135,6 +137,7 @@ class EnergieCorePredictor(hass.Hass):
         self.MIN_VERBRUIK_KW = float(self.args.get("min_verbruik_kw", self.MIN_VERBRUIK_KW))
         self.EPEX_UNIT_MULTIPLIER = float(self.args.get("epex_unit_multiplier", self.EPEX_UNIT_MULTIPLIER))
         self.EPEX_PRIJS_IS_TOTAAL = bool(self.args.get("epex_prijs_is_totaal", self.EPEX_PRIJS_IS_TOTAAL))
+        self.NORDPOOL_UNIT_MULTIPLIER = float(self.args.get("nordpool_unit_multiplier", self.NORDPOOL_UNIT_MULTIPLIER))
         self.MAX_EPEX_FORECAST_HOURS = int(self.args.get("max_epex_forecast_hours", self.MAX_EPEX_FORECAST_HOURS))
         self.DEBUG_LOGGING = bool(self.args.get("debug_logging", self.DEBUG_LOGGING))
         self.ENERGIEBELASTING_PER_KWH = float(self.args.get("energiebelasting_per_kwh", self.ENERGIEBELASTING_PER_KWH))
@@ -483,14 +486,17 @@ class EnergieCorePredictor(hass.Hass):
             return
 
         recent_q, recent_bron = self._bouw_kwartier_kwh(nu - datetime.timedelta(days=self.HISTORY_DAYS), nu, probe_5min=False)
+        recent_problemen = set(self._laad_problemen)
+        self._laad_problemen = set()
         centrum = self._zelfde_datum_vorig_jaar(nu)
         marge = datetime.timedelta(days=self.VORIG_JAAR_MARGE_DAGEN)
         vorig_q, vorig_bron = self._bouw_kwartier_kwh(centrum - marge, centrum + marge, probe_5min=True)
+        vorig_problemen = set(self._laad_problemen)
 
         profiel_recent, r_totaal, r_uit = self._bouw_profiel(recent_q)
         profiel_vorig, v_totaal, v_uit = self._bouw_profiel(vorig_q)
 
-        waarschuwingen = sorted(self._laad_problemen)
+        waarschuwingen = sorted(recent_problemen)
         totaal = r_totaal + v_totaal
         uitgesloten = r_uit + v_uit
         if totaal > 0 and uitgesloten / totaal > 0.05:
@@ -515,9 +521,11 @@ class EnergieCorePredictor(hass.Hass):
                 waarschuwingen.append("Geen nieuw recent profiel geladen; laatst bekende profiel blijft actief waar beschikbaar.")
             if profiel_vorig:
                 self.profiel_vorig_jaar = profiel_vorig
-            else:
-                waarschuwingen.append("Geen nieuw profiel van vorig jaar geladen; laatst bekende profiel blijft actief waar beschikbaar.")
-            if profiel_recent and profiel_vorig:
+            elif vorig_problemen:
+                # Geen fout: de tellers bestonden vorig jaar mogelijk nog niet. Alleen loggen, niet in status/waarschuwingen.
+                self.log("Geen volledige statistics van vorig jaar; profiel vorig jaar wordt niet gebruikt: "
+                         + "; ".join(sorted(vorig_problemen))[:300])
+            if profiel_recent:
                 self.historie_geladen_op = nu
                 self._history_next_try = None
             else:
@@ -559,6 +567,8 @@ class EnergieCorePredictor(hass.Hass):
                 period_end = self._parse_iso_to_utc(f["period_end"])
                 period_start = period_end - datetime.timedelta(minutes=30)
                 pv_kwh = max(0.0, float(f.get("pv_estimate", 0.0) or 0.0)) / deler
+                if not math.isfinite(pv_kwh):
+                    raise ValueError("niet-eindige pv_estimate")
                 for i in range(2):
                     kwartier_start = period_start + datetime.timedelta(minutes=i * self.QUARTER_MINUTES)
                     self.forecast_dict[kwartier_start] = pv_kwh
@@ -574,76 +584,97 @@ class EnergieCorePredictor(hass.Hass):
     # ===== PRIJZEN (Nordpool primair, EpexPredictor voor ontbrekende kwartieren) =====
     def _build_prijs_dict(self, waarschuwingen: List[str]):
         self.prijs_dict = {}
-        self.prijs_bron_dict: Dict[datetime.datetime, str] = {}
+        self.prijs_bron_dict = {}
+        self.prijsbron_afwijking = None
+        kwartier = datetime.timedelta(minutes=self.QUARTER_MINUTES)
 
+        # --- Nordpool (definitieve day-ahead prijzen): alleen raw_today / raw_tomorrow ---
+        nordpool_ongeldig = 0
         nordpool = self.get_state(self.nordpool_prijs_entity, attribute="all")
         nordpool_attrs = (nordpool.get("attributes", {}) or {}) if nordpool else {}
-        nordpool_prijzen = []
-        for key in ("prices_today", "prices_tomorrow", "Prices today", "Prices tomorrow",
-                    "raw_today", "raw_tomorrow", "today", "tomorrow"):
-            waarden = nordpool_attrs.get(key, [])
-            if isinstance(waarden, list):
-                nordpool_prijzen.extend(waarden)
-
-        nordpool_ongeldig = 0
-        for item in nordpool_prijzen:
-            try:
-                start = self._floor_kwartier(self._parse_iso_to_utc(item["start"]))
-                einde = self._parse_iso_to_utc(item["end"]) if item.get("end") else start + datetime.timedelta(minutes=15)
-                prijs = float(item.get("price", item.get("value"))) * self.EPEX_UNIT_MULTIPLIER
-                aantal_kwartieren = max(1, int((einde - start).total_seconds() // 900))
-                for k in range(aantal_kwartieren):
-                    slot = start + datetime.timedelta(minutes=k * self.QUARTER_MINUTES)
-                    self.prijs_dict[slot] = prijs
-                    self.prijs_bron_dict[slot] = "nordpool"
-            except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as e:
-                nordpool_ongeldig += 1
-                if self.DEBUG_LOGGING:
-                    self.log(f"[DEBUG] Ongeldige Nordpool prijs: {self._sanitize_error(e)}")
+        for key in ("raw_today", "raw_tomorrow"):
+            waarden = nordpool_attrs.get(key)
+            if not isinstance(waarden, list):
+                continue
+            for item in waarden:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    ruw = item.get("value", item.get("price"))
+                    if ruw is None:
+                        continue
+                    ruw = float(ruw)
+                    if not math.isfinite(ruw):
+                        continue  # ontbrekende prijs: kwartier blijft over voor EpexPredictor
+                    start = self._floor_kwartier(self._parse_iso_to_utc(item["start"]))
+                    einde = self._parse_iso_to_utc(item["end"]) if item.get("end") else start + kwartier
+                    aantal_kwartieren = max(1, min(4, int((einde - start).total_seconds() // 900)))
+                    for k in range(aantal_kwartieren):
+                        slot = start + k * kwartier
+                        self.prijs_dict[slot] = ruw * self.NORDPOOL_UNIT_MULTIPLIER
+                        self.prijs_bron_dict[slot] = "nordpool"
+                except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as e:
+                    nordpool_ongeldig += 1
+                    if self.DEBUG_LOGGING:
+                        self.log(f"[DEBUG] Ongeldige Nordpool prijs: {self._sanitize_error(e)}")
         if nordpool_ongeldig:
             waarschuwingen.append("Nordpool-prijzen met ongeldige data overgeslagen.")
 
+        # --- EpexPredictor (voorspelling): attributen s = unix-tijden, t = prijzen ---
+        voorspeld: Dict[datetime.datetime, float] = {}
+        predictor_probleem: Optional[str] = None
         p = self.get_state(self.epex_prijs_entity, attribute="all")
-        if not p:
-            waarschuwingen.append("Geen EPEX Predictor-prijzen beschikbaar; Nordpool wordt gebruikt waar beschikbaar.")
-            return
-        attrs = p.get("attributes", {}) or {}
+        attrs = (p.get("attributes", {}) or {}) if p else {}
         s_lijst = attrs.get("s")
         t_lijst = attrs.get("t")
-        if not isinstance(s_lijst, list) or not isinstance(t_lijst, list) or not s_lijst or len(s_lijst) != len(t_lijst):
-            waarschuwingen.append("EPEX Predictor mist geldige attributen 's' en 't'; Nordpool wordt gebruikt waar beschikbaar.")
-            return
-        ongeldig = 0
-        vorige_duur = 900.0
-        aantal = len(s_lijst)
-        for i in range(aantal):
-            try:
-                start_ts = float(s_lijst[i])
-                if i + 1 < aantal:
-                    duur = float(s_lijst[i + 1]) - start_ts
-                else:
-                    duur = vorige_duur
-                if duur <= 0:
-                    duur = 900.0
-                vorige_duur = duur
-                aantal_kwartieren = max(1, min(4, int(round(duur / 900.0))))
-                prijs = float(t_lijst[i]) * self.EPEX_UNIT_MULTIPLIER
-                if self.EPEX_PRIJS_IS_TOTAAL:
-                    prijs = self._totaal_naar_epex(prijs)
-                start = self._floor_kwartier(datetime.datetime.fromtimestamp(start_ts, tz.UTC))
-                for k in range(aantal_kwartieren):
-                    slot = start + datetime.timedelta(minutes=k * self.QUARTER_MINUTES)
-                    if slot not in self.prijs_dict:
-                        self.prijs_dict[slot] = prijs
-                        self.prijs_bron_dict[slot] = "epex"
-            except (ValueError, TypeError, OverflowError, OSError) as e:
-                ongeldig += 1
-                if self.DEBUG_LOGGING:
-                    self.log(f"[DEBUG] Ongeldige EPEX prijs: {self._sanitize_error(e)}")
-        if ongeldig:
-            waarschuwingen.append("EPEX Predictor-prijzen met ongeldige data overgeslagen.")
+        if not p:
+            predictor_probleem = "EPEX Predictor-sensor niet beschikbaar"
+        elif not isinstance(s_lijst, list) or not isinstance(t_lijst, list) or not s_lijst or len(s_lijst) != len(t_lijst):
+            predictor_probleem = "EPEX Predictor mist geldige attributen 's' en 't'"
+        else:
+            ongeldig = 0
+            vorige_duur = 900.0
+            aantal = len(s_lijst)
+            for i in range(aantal):
+                try:
+                    start_ts = float(s_lijst[i])
+                    duur = (float(s_lijst[i + 1]) - start_ts) if i + 1 < aantal else vorige_duur
+                    if duur <= 0:
+                        duur = 900.0
+                    vorige_duur = duur
+                    aantal_kwartieren = max(1, min(4, int(round(duur / 900.0))))
+                    prijs = float(t_lijst[i]) * self.EPEX_UNIT_MULTIPLIER
+                    if not math.isfinite(prijs):
+                        raise ValueError("niet-eindige prijs")
+                    if self.EPEX_PRIJS_IS_TOTAAL:
+                        prijs = self._totaal_naar_epex(prijs)
+                    start = self._floor_kwartier(datetime.datetime.fromtimestamp(start_ts, tz.UTC))
+                    for k in range(aantal_kwartieren):
+                        voorspeld[start + k * kwartier] = prijs
+                except (ValueError, TypeError, OverflowError, OSError) as e:
+                    ongeldig += 1
+                    if self.DEBUG_LOGGING:
+                        self.log(f"[DEBUG] Ongeldige EPEX prijs: {self._sanitize_error(e)}")
+            if ongeldig:
+                waarschuwingen.append("EPEX Predictor-prijzen met ongeldige data overgeslagen.")
+
+        # Alleen ter informatie: gemiddelde afwijking van de voorspelling t.o.v. de echte Nordpool-prijzen
+        # op kwartieren waar beide bronnen een prijs hebben (geen waarschuwing: afwijkingen zijn normaal).
+        overlap = [slot for slot in voorspeld if self.prijs_bron_dict.get(slot) == "nordpool"]
+        if len(overlap) >= 8:
+            afwijking = sum(abs(self.prijs_dict[slot] - voorspeld[slot]) for slot in overlap) / len(overlap)
+            self.prijsbron_afwijking = round(afwijking, 4)
+
+        # EpexPredictor vult alleen kwartieren waarvoor Nordpool geen prijs heeft
+        for slot, prijs in voorspeld.items():
+            if slot not in self.prijs_dict:
+                self.prijs_dict[slot] = prijs
+                self.prijs_bron_dict[slot] = "epex"
+
         if not self.prijs_dict:
             waarschuwingen.append("Geen bruikbare Nordpool- of EPEX Predictor-prijzen; fallbackprijs gebruikt.")
+        elif predictor_probleem:
+            waarschuwingen.append(f"{predictor_probleem}; alleen Nordpool-prijzen beschikbaar.")
 
     # ===== WAARSCHUWINGEN (ALLEEN LOGGEN BIJ VERANDERING) =====
     def _log_waarschuwingen_bij_verandering(self, waarschuwingen: List[str]):
@@ -706,7 +737,8 @@ class EnergieCorePredictor(hass.Hass):
                 self.last_build = nu
 
                 huidig_kwartier_fallback = bool(matrix) and matrix[0]["prijs_bron"] == "fallback"
-                if not self.prijs_dict or not self.forecast_dict or huidig_kwartier_fallback:
+                if (not self.prijs_dict or not self.forecast_dict or huidig_kwartier_fallback
+                        or (self.forecast_dict and laatste_pv_slot is None)):
                     status = "degraded"
                 elif (fallback_slots > 0 or pv_ontbrekende_slots > 0 or self._historie_waarschuwingen
                       or (not self.profiel_recent and not self.profiel_vorig_jaar)):
@@ -715,9 +747,12 @@ class EnergieCorePredictor(hass.Hass):
                     status = "ok"
 
                 if pv_ontbrekende_slots and self.forecast_dict:
-                    waarschuwingen.append(
-                        f"PV-data ontbreekt voor {pv_ontbrekende_slots} van {aantal_slots} forecastkwartieren; ontbrekende waarden zijn 0 kWh."
-                    )
+                    if laatste_pv_slot is not None:
+                        pv_einde = (laatste_pv_slot + datetime.timedelta(minutes=self.QUARTER_MINUTES))
+                        pv_einde_txt = pv_einde.astimezone(self._local_tz).strftime("%d-%m %H:%M")
+                        waarschuwingen.append(f"Solcast-dekking eindigt op {pv_einde_txt}; daarna is PV = 0 kWh in de matrix.")
+                    else:
+                        waarschuwingen.append("Solcast-data bevat geen enkel kwartier binnen de horizon (verouderd?); PV = 0 kWh.")
 
                 n_recent, n_vorig = self._tel_historie_blokken()
                 einde_slot = eerste_slot + datetime.timedelta(minutes=aantal_slots * self.QUARTER_MINUTES)
@@ -738,6 +773,7 @@ class EnergieCorePredictor(hass.Hass):
                     "slot_count": len(matrix),
                     "fallback_prijs_slots": fallback_slots,
                     "pv_ontbrekende_slots": pv_ontbrekende_slots,
+                    "prijsbron_afwijking": self.prijsbron_afwijking,
                     "prijs_dekking_tot": (laatste_prijs_slot + kwartier).isoformat() if laatste_prijs_slot else None,
                     "pv_dekking_tot": (laatste_pv_slot + kwartier).isoformat() if laatste_pv_slot else None,
                     "verbruik_plus_entities": self.verbruik_plus_entities,
