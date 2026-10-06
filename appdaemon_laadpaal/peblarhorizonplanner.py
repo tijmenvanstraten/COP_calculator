@@ -2,6 +2,7 @@ import hassapi as hass
 import datetime
 import threading
 import json
+import math
 import re
 from typing import Dict, Optional, Any
 from dateutil import tz
@@ -30,6 +31,8 @@ class PeblarHorizonPlanner(hass.Hass):
     MIN_RUN_MINUTES = 30
     MIN_LAADVERMOGEN_ZON_KW = 1.38
     GRAPH_ATTRIBUTE_MAX_BYTES = 12000
+    PROGRESS_UPDATE_DEBOUNCE_SECONDS = 5
+    PROGRESS_UPDATE_MIN_DELTA_KWH = 0.01
 
     # Energie core forecast
     FORECAST_MAX_AGE_MINUTES = 45
@@ -100,6 +103,9 @@ class PeblarHorizonPlanner(hass.Hass):
         self._control_generation = 0
         self._pending_control_timer = None
         self._minimum_off_timer = None
+        self._progress_update_timer = None
+        self._last_progress_kwh = None
+        self._last_switch_command_state = None
         self.planning_geannuleerd = False
         self._plan_status = "geen_plan"
         self._plan_message = None
@@ -133,6 +139,7 @@ class PeblarHorizonPlanner(hass.Hass):
         with self._lock:
             self._cancel_pending_control()
             self._cancel_minimum_off_timer()
+            self._cancel_progress_update_timer()
             self._set_execution_boolean(False)
             self._set_desired_state("Pure solar", False, 0.0)
 
@@ -140,9 +147,25 @@ class PeblarHorizonPlanner(hass.Hass):
         self.listen_service(self._annuleer_planning_service, self.ANNULEER_SERVICE)
 
     def _set_plan_status(self, status: str, message: Optional[str] = None):
+        if status != "in_uitvoering":
+            self._cancel_progress_update_timer()
         self._plan_status = status
         self._plan_message = message
-        resterend = max(0.0, self.sessie_doel_kwh - self.cumulatief_geladen_kwh)
+        doel_kwh = self._finite_nonnegative(self.sessie_doel_kwh)
+        geladen_kwh = self._finite_nonnegative(self.cumulatief_geladen_kwh)
+        initiele_energie = self._finite_nonnegative(self.initiele_energie)
+        sessie_geldig = (
+            self.sessie_actief
+            and initiele_energie is not None
+            and doel_kwh is not None
+            and geladen_kwh is not None
+        )
+        if not sessie_geldig:
+            doel_kwh = None
+            geladen_kwh = None
+            resterend = None
+        else:
+            resterend = max(0.0, doel_kwh - geladen_kwh)
         fallback_count = sum(
             1 for slot in self.matrix_kwartieren if slot.get("prijs_bron") == "fallback"
         )
@@ -153,9 +176,9 @@ class PeblarHorizonPlanner(hass.Hass):
             attributes={
                 "friendly_name": "Peblar laadplanstatus",
                 "message": message,
-                "doel_kwh": round(self.sessie_doel_kwh, 3),
-                "geladen_kwh": round(self.cumulatief_geladen_kwh, 3),
-                "resterend_kwh": round(resterend, 3),
+                "doel_kwh": round(doel_kwh, 3) if doel_kwh is not None else None,
+                "geladen_kwh": round(geladen_kwh, 3) if geladen_kwh is not None else None,
+                "resterend_kwh": round(resterend, 3) if resterend is not None else None,
                 "fallback_prijs_kwartieren": fallback_count,
                 "fallback_prijs_percentage": round(100.0 * fallback_count / slot_count, 1) if slot_count else 0.0,
                 "updated_at": datetime.datetime.now(tz.UTC).isoformat(),
@@ -166,14 +189,59 @@ class PeblarHorizonPlanner(hass.Hass):
 
     def _meterstand_changed(self, entity, attribute, old, new, kwargs):
         with self._lock:
-            if self._plan_status != "in_uitvoering" or self.initiele_energie is None:
+            if (
+                self._plan_status != "in_uitvoering"
+                or not self.sessie_actief
+                or self._finite_nonnegative(self.initiele_energie) is None
+            ):
+                return
+            huidige_energie = self.get_sensor_float(self.peblar_energie_entity)
+            if huidige_energie is None:
+                return
+            cumulatief = max(0.0, huidige_energie - self.initiele_energie)
+            if (
+                self._last_progress_kwh is not None
+                and abs(cumulatief - self._last_progress_kwh) < self.PROGRESS_UPDATE_MIN_DELTA_KWH
+            ):
+                return
+            if self._progress_update_timer is None:
+                self._progress_update_timer = self.run_in(
+                    self._progress_update_callback,
+                    self.PROGRESS_UPDATE_DEBOUNCE_SECONDS,
+                )
+
+    def _progress_update_callback(self, kwargs):
+        with self._lock:
+            self._progress_update_timer = None
+            if (
+                self._plan_status != "in_uitvoering"
+                or not self.sessie_actief
+                or self._finite_nonnegative(self.initiele_energie) is None
+            ):
                 return
             huidige_energie = self.get_sensor_float(self.peblar_energie_entity)
             if huidige_energie is None:
                 return
             self.cumulatief_geladen_kwh = max(0.0, huidige_energie - self.initiele_energie)
+            self._last_progress_kwh = self.cumulatief_geladen_kwh
             self._set_plan_status(self._plan_status, self._plan_message)
             self._save_persistent_data()
+
+    def _cancel_progress_update_timer(self):
+        timer = getattr(self, "_progress_update_timer", None)
+        if timer is not None:
+            self.cancel_timer(timer)
+            self._progress_update_timer = None
+
+    @staticmethod
+    def _finite_nonnegative(value) -> Optional[float]:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or number < 0:
+            return None
+        return number
 
     def _set_execution_boolean(self, enabled: bool):
         desired = "on" if enabled else "off"
@@ -239,6 +307,8 @@ class PeblarHorizonPlanner(hass.Hass):
             nu = datetime.datetime.now(tz.UTC)
             self._plan_start_time = nu
             self._plan_start_meterstand = huidige_energie
+            if self._finite_nonnegative(self.initiele_energie) is not None:
+                self._last_progress_kwh = self.cumulatief_geladen_kwh
             self.plan_valid_until = nu + datetime.timedelta(minutes=self.PLAN_VALIDITY_MINUTES)
             self._set_plan_status("in_uitvoering")
             self.voer_schakeling_uit()
@@ -316,6 +386,7 @@ class PeblarHorizonPlanner(hass.Hass):
                 self.planning_geannuleerd = bool(data.get("planning_geannuleerd", False))
                 # Sessie alleen hervatten als er een startmeterstand is om tegen te meten
                 self.sessie_actief = bool(data.get("sessie_actief", False)) and self.initiele_energie is not None
+                self._last_progress_kwh = self.cumulatief_geladen_kwh
                 self._last_persist_payload = str(state)
             self.log(f"Persistente data geladen: sessie_actief={self.sessie_actief}, "
                      f"initiele_energie={self.initiele_energie}, geannuleerd={self.planning_geannuleerd}")
@@ -453,8 +524,10 @@ class PeblarHorizonPlanner(hass.Hass):
 
     def _reset_laadtracking(self):
         with self._lock:
+            self._cancel_progress_update_timer()
             self.cumulatief_geladen_kwh = 0.0
             self.initiele_energie = None
+            self._last_progress_kwh = None
             self.sessie_doel_kwh = 0.0
             self.sessie_actief = False
             self.vorige_soc = None
@@ -506,6 +579,33 @@ class PeblarHorizonPlanner(hass.Hass):
                 self.last_power_on_time = None
             elif old != "on" and new == "on":
                 self.last_power_on_time = datetime.datetime.now(tz.UTC)
+            if new == self._last_switch_command_state:
+                self._last_switch_command_state = None
+                return
+            if self._plan_status != "in_uitvoering" or str(
+                self.get_state(self.PLAN_UITVOEREN_BOOLEAN) or ""
+            ).lower() != "on":
+                return
+            expected_state = "on" if self._desired_power_on else "off"
+            if new == expected_state:
+                return
+            self.log(
+                f"Onverwachte handmatige wijziging van de Peblar-switch "
+                f"({old} -> {new}); uitvoering wordt gepauzeerd."
+            )
+            self._set_execution_boolean(False)
+            if new == "on":
+                self._set_desired_state("Pure solar", False, 0.0)
+            else:
+                self._desired_power_on = False
+                self._desired_kw = 0.0
+                self._cancel_pending_control()
+            self._plan_start_time = None
+            self._plan_start_meterstand = None
+            self._set_plan_status(
+                "gepauzeerd",
+                "De Peblar-switch is handmatig gewijzigd; controleer de laadpaal en hervat bewust.",
+            )
 
     def _set_state_respecting_minimum_off(self, mode: str, power_on: bool, power_kw: float):
         if not power_on:
@@ -790,8 +890,10 @@ class PeblarHorizonPlanner(hass.Hass):
                     return
 
                 laad_behoefte_kwh = netto_behoefte_kwh / self.LAADRENDEMENT
+                self._cancel_progress_update_timer()
                 self.initiele_energie = max(0.0, huidige_energie)
                 self.cumulatief_geladen_kwh = 0.0
+                self._last_progress_kwh = 0.0
                 self.sessie_actief = True
                 self.sessie_doel_kwh = laad_behoefte_kwh
                 self.doel_soc = doel_soc
@@ -1473,6 +1575,7 @@ class PeblarHorizonPlanner(hass.Hass):
     def _force_switch_off(self):
         current_switch = self.get_state(self.peblar_switch_entity)
         if current_switch != "off":
+            self._last_switch_command_state = "off"
             self.call_service("switch/turn_off", entity_id=self.peblar_switch_entity)
             self.last_switch_call = datetime.datetime.now(tz.UTC)
             self.last_power_off_time = self.last_switch_call
@@ -1482,6 +1585,7 @@ class PeblarHorizonPlanner(hass.Hass):
     def _force_switch_on(self):
         current_switch = self.get_state(self.peblar_switch_entity)
         if current_switch != "on":
+            self._last_switch_command_state = "on"
             self.call_service("switch/turn_on", entity_id=self.peblar_switch_entity)
             self.last_switch_call = datetime.datetime.now(tz.UTC)
             self.last_power_on_time = self.last_switch_call

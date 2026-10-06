@@ -283,6 +283,121 @@ class PeblarHorizonPlannerTests(unittest.TestCase):
         self.assertEqual(planner._reset_calls, [])
         self.assertEqual(planner._clear_plan_calls, [])
 
+    def test_meter_updates_are_thresholded_and_debounced(self):
+        planner = self.make_planner()
+        planner._plan_status = "in_uitvoering"
+        planner._plan_message = None
+        planner.sessie_actief = True
+        planner.initiele_energie = 100.0
+        planner.cumulatief_geladen_kwh = 0.0
+        planner._last_progress_kwh = 0.0
+        planner._progress_update_timer = None
+        planner.PROGRESS_UPDATE_MIN_DELTA_KWH = 0.01
+        planner.PROGRESS_UPDATE_DEBOUNCE_SECONDS = 5
+        planner.peblar_energie_entity = "energy"
+        planner.get_sensor_float = lambda entity: 100.015
+        scheduled = []
+        planner.run_in = lambda callback, delay: scheduled.append((callback, delay)) or "timer-1"
+        planner.set_state = lambda *args, **kwargs: None
+        planner._save_persistent_data = lambda: None
+        planner._update_graph_data = lambda: None
+
+        planner.get_sensor_float = lambda entity: 100.005
+        planner._meterstand_changed("energy", None, "100", "100.005", {})
+        self.assertEqual(scheduled, [])
+
+        planner.get_sensor_float = lambda entity: 100.015
+        planner._meterstand_changed("energy", None, "100.005", "100.015", {})
+        planner._meterstand_changed("energy", None, "100.015", "100.02", {})
+
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(scheduled[0][1], 5)
+
+    def test_progress_status_is_unknown_without_a_valid_session_baseline(self):
+        planner = self.make_planner()
+        planner.PLAN_STATUS_ENTITY = "status"
+        planner.matrix_kwartieren = []
+        planner.sessie_actief = False
+        planner.initiele_energie = None
+        planner.sessie_doel_kwh = 20.0
+        planner.cumulatief_geladen_kwh = 5.0
+        planner._plan_status = "geen_plan"
+        planner._update_graph_data = lambda: None
+        recorded = {}
+        planner.set_state = lambda entity, **kwargs: recorded.update(kwargs)
+
+        planner._set_plan_status("geen_plan")
+
+        attrs = recorded["attributes"]
+        self.assertIsNone(attrs["doel_kwh"])
+        self.assertIsNone(attrs["geladen_kwh"])
+        self.assertIsNone(attrs["resterend_kwh"])
+
+    def test_meter_callback_ignores_tiny_delta_and_publishes_latest_progress(self):
+        planner = self.make_planner()
+        planner._plan_status = "in_uitvoering"
+        planner._plan_message = None
+        planner.sessie_actief = True
+        planner.initiele_energie = 100.0
+        planner.cumulatief_geladen_kwh = 0.0
+        planner._last_progress_kwh = 0.0
+        planner._progress_update_timer = None
+        planner.peblar_energie_entity = "energy"
+        planner.get_sensor_float = lambda entity: 100.015
+        status_updates = []
+        saves = []
+        planner._set_plan_status = lambda status, message: status_updates.append((status, message))
+        planner._save_persistent_data = lambda: saves.append(True)
+
+        planner._progress_update_callback({})
+
+        self.assertAlmostEqual(planner.cumulatief_geladen_kwh, 0.015)
+        self.assertAlmostEqual(planner._last_progress_kwh, 0.015)
+        self.assertEqual(status_updates, [("in_uitvoering", None)])
+        self.assertEqual(saves, [True])
+
+    def test_unexpected_manual_switch_off_pauses_active_plan(self):
+        planner = self.make_planner()
+        planner._plan_status = "in_uitvoering"
+        planner._desired_power_on = True
+        planner._last_switch_command_state = None
+        planner.PLAN_UITVOEREN_BOOLEAN = "execution"
+        planner._plan_start_time = object()
+        planner._plan_start_meterstand = 100.0
+        planner.last_power_on_time = None
+        planner.last_power_off_time = None
+        planner._control_generation = 0
+        actions = []
+        planner.get_state = lambda entity: "on"
+        planner.log = lambda *args, **kwargs: None
+        planner._set_execution_boolean = lambda enabled: actions.append(("execution", enabled))
+        planner._set_plan_status = lambda status, message=None: actions.append(("status", status, message))
+        planner._cancel_pending_control = lambda: actions.append(("cancel",))
+        planner._set_desired_state = lambda *args: actions.append(("desired", *args))
+
+        planner._peblar_switch_changed("switch", None, "on", "off", {})
+
+        self.assertIn(("execution", False), actions)
+        self.assertTrue(any(action[:2] == ("status", "gepauzeerd") for action in actions))
+        self.assertIsNone(planner._plan_start_time)
+        self.assertIsNone(planner._plan_start_meterstand)
+
+    def test_planned_switch_off_does_not_pause_execution(self):
+        planner = self.make_planner()
+        planner._plan_status = "in_uitvoering"
+        planner._desired_power_on = False
+        planner._last_switch_command_state = "off"
+        planner.PLAN_UITVOEREN_BOOLEAN = "execution"
+        planner.last_power_on_time = datetime.datetime.now(tz.UTC)
+        planner.last_power_off_time = None
+        planner.get_state = lambda entity: "off"
+        planner._set_execution_boolean = lambda enabled: self.fail("Planned switch off paused execution.")
+        planner._set_plan_status = lambda *args: self.fail("Planned switch off changed plan status.")
+
+        planner._peblar_switch_changed("switch", None, "on", "off", {})
+
+        self.assertIsNone(planner._last_switch_command_state)
+
     def test_soc_jump_is_checked_against_charger_meter_energy(self):
         planner = self.make_planner()
         planner.vorige_soc = 50.0
