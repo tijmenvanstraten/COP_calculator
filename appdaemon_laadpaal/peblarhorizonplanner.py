@@ -153,7 +153,7 @@ class PeblarHorizonPlanner(hass.Hass):
 
         self._set_execution_boolean(False)
         self._set_plan_status("geen_plan")
-        self._set_desired_state("Pure solar", False, 0.0)
+        self._set_solar_charging_state()
 
     def terminate(self):
         with self._lock:
@@ -270,11 +270,18 @@ class PeblarHorizonPlanner(hass.Hass):
             service = "input_boolean/turn_on" if enabled else "input_boolean/turn_off"
             self.call_service(service, entity_id=self.PLAN_UITVOEREN_BOOLEAN)
 
+    def _set_solar_charging_state(self):
+        status_klasse = self._status_klasse(self.get_state(self.peblar_status_entity))
+        if status_klasse == "verbonden":
+            self._set_desired_state("Pure solar", True, self.MAX_PAAL_KW)
+        elif status_klasse == "losgekoppeld":
+            self._set_desired_state("Pure solar", False, 0.0)
+
     def _plan_berekenen_ingedrukt(self, entity, attribute, old, new, kwargs):
         with self._lock:
             self.planning_geannuleerd = False
             self._set_execution_boolean(False)
-            self._set_desired_state("Pure solar", False, 0.0)
+            self._set_solar_charging_state()
             self._set_plan_status("berekenen")
             self.last_plan_calculation = None
             self.bereken_laadplan()
@@ -292,7 +299,7 @@ class PeblarHorizonPlanner(hass.Hass):
         with self._lock:
             if str(new).lower() != "on":
                 if self._plan_status == "in_uitvoering":
-                    self._set_desired_state("Pure solar", False, 0.0)
+                    self._set_solar_charging_state()
                     self._plan_start_time = None
                     self._plan_start_meterstand = None
                     self._set_plan_status("gepauzeerd", "Uitvoering gepauzeerd; zet de schakelaar aan om het plan te hervatten.")
@@ -337,7 +344,7 @@ class PeblarHorizonPlanner(hass.Hass):
                 return
             had_plan = bool(self.matrix_kwartieren)
             self._set_execution_boolean(False)
-            self._set_desired_state("Pure solar", False, 0.0)
+            self._set_solar_charging_state()
             self._clear_plan()
             self.last_plan_calculation = None
             status = "opnieuw_berekenen" if had_plan else "geen_plan"
@@ -350,7 +357,7 @@ class PeblarHorizonPlanner(hass.Hass):
             self.planning_geannuleerd = True
             self._set_execution_boolean(False)
             self._clear_plan()
-            self._set_desired_state("Pure solar", False, 0.0)
+            self._set_solar_charging_state()
             self._reset_laadtracking()
             self._set_plan_status("geannuleerd")
             self._save_persistent_data()
@@ -619,27 +626,24 @@ class PeblarHorizonPlanner(hass.Hass):
             if self._plan_status != "in_uitvoering" or str(
                 self.get_state(self.PLAN_UITVOEREN_BOOLEAN) or ""
             ).lower() != "on":
+                if self._is_auto_verbonden():
+                    self._set_solar_charging_state()
                 return
             expected_state = "on" if self._desired_power_on else "off"
             if new == expected_state:
                 return
             self.log(
                 f"Onverwachte handmatige wijziging van de Peblar-switch "
-                f"({old} -> {new}); uitvoering wordt gepauzeerd."
+                f"({old} -> {new}); planuitvoering wordt gepauzeerd."
             )
             self._set_execution_boolean(False)
-            if new == "on":
-                self._set_desired_state("Pure solar", False, 0.0)
-            else:
-                self._desired_power_on = False
-                self._desired_kw = 0.0
-                self._cancel_pending_control()
             self._plan_start_time = None
             self._plan_start_meterstand = None
             self._set_plan_status(
                 "gepauzeerd",
                 "De Peblar-switch is handmatig gewijzigd; controleer de laadpaal en hervat bewust.",
             )
+            self._set_solar_charging_state()
 
     def _set_state_respecting_minimum_off(self, mode: str, power_on: bool, power_kw: float):
         if not power_on:
@@ -733,8 +737,6 @@ class PeblarHorizonPlanner(hass.Hass):
 
     def _auto_status_changed(self, entity, attribute, old, new, kwargs):
         with self._lock:
-            if self.planning_geannuleerd:
-                return
             klasse = self._status_klasse(new)
             if klasse == "niet_beschikbaar":
                 self._log_bij_verandering(
@@ -775,6 +777,13 @@ class PeblarHorizonPlanner(hass.Hass):
                     self.vorige_soc_energie = None
                     self.planning_geannuleerd = False
                     self.log(f"Auto verbonden (status: {new}). Nieuwe sessie gestart, SoC={huidige_soc}%")
+                if (
+                    self._plan_status == "in_uitvoering"
+                    and str(self.get_state(self.PLAN_UITVOEREN_BOOLEAN) or "").lower() == "on"
+                ):
+                    self.voer_schakeling_uit()
+                else:
+                    self._set_solar_charging_state()
 
     def _sanitize_error(self, error: Exception) -> str:
         error_str = str(error)
@@ -1016,13 +1025,13 @@ class PeblarHorizonPlanner(hass.Hass):
         self._wacht_op_forecast = abort.wacht_forecast
         if abort.afgekoppeld:
             self._set_execution_boolean(False)
-            self._set_desired_state("Pure solar", False, 0.0)
+            self._set_solar_charging_state()
             self._reset_laadtracking()
             self._clear_plan()
             self._set_plan_status("opnieuw_berekenen", "Auto losgekoppeld; maak na opnieuw aansluiten een nieuw plan.")
         else:
             self._clear_plan()
-            self._set_desired_state("Pure solar", False, 0.0)
+            self._set_solar_charging_state()
             self._reset_laadtracking()
         self._save_persistent_data()
 
@@ -1220,13 +1229,12 @@ class PeblarHorizonPlanner(hass.Hass):
     def voer_schakeling_uit(self):
         with self._lock:
             try:
-                if self.planning_geannuleerd:
-                    self.log("Planning geannuleerd, geen schakeling.")
-                    self._set_desired_state("Pure solar", False, 0.0)
-                    return
-                if (self._plan_status != "in_uitvoering" or
-                    str(self.get_state(self.PLAN_UITVOEREN_BOOLEAN)).lower() != "on"):
-                    self._set_desired_state("Pure solar", False, 0.0)
+                if (
+                    self.planning_geannuleerd
+                    or self._plan_status != "in_uitvoering"
+                    or str(self.get_state(self.PLAN_UITVOEREN_BOOLEAN)).lower() != "on"
+                ):
+                    self._set_solar_charging_state()
                     return
 
                 nu = datetime.datetime.now(tz.UTC)
@@ -1297,8 +1305,8 @@ class PeblarHorizonPlanner(hass.Hass):
                                    abs(afwijking_kwh) >= self.PLAN_CORRECTIE_TOLERANTIE_KWH)
                 if plan_ontbreekt:
                     self._set_execution_boolean(False)
-                    self._set_desired_state("Pure solar", False, 0.0)
                     self._set_plan_status("concept_verlopen", "Bereken en keur een nieuw plan goed.")
+                    self._set_solar_charging_state()
                     return
                 if grote_afwijking:
                     self.log(f"Laadenergie wijkt {afwijking_kwh:+.2f} kWh af van plan; planning corrigeren.")
@@ -1318,18 +1326,14 @@ class PeblarHorizonPlanner(hass.Hass):
 
                 # Stopcondities
                 if resterend <= self.TOLERANCE and self.sessie_actief:
-                    actueel = next((u for u in self.matrix_kwartieren if u["tijd"] == huidig_kwartier), None)
-                    if actueel and actueel["laadbare_zon_kwh"] > self.TOLERANCE:
-                        self.log("Netladen klaar, maar zonladen nog mogelijk.")
-                    else:
-                        self.log(f"kWh-doel bereikt ({self.cumulatief_geladen_kwh:.2f} kWh). Sessie afsluiten.")
-                        self._send_push_notification("kWh-Doel Bereikt", f"kWh-doel van {self.sessie_doel_kwh:.2f} kWh bereikt.")
-                        self._set_execution_boolean(False)
-                        self._set_desired_state("Pure solar", False, 0.0)
-                        self._reset_laadtracking()
-                        self._set_plan_status("voltooid")
-                        self._save_persistent_data()
-                        return
+                    self.log(f"kWh-doel bereikt ({self.cumulatief_geladen_kwh:.2f} kWh). Netlaadplan afgerond.")
+                    self._send_push_notification("kWh-Doel Bereikt", f"kWh-doel van {self.sessie_doel_kwh:.2f} kWh bereikt.")
+                    self._set_execution_boolean(False)
+                    self._reset_laadtracking()
+                    self._set_plan_status("voltooid")
+                    self._set_solar_charging_state()
+                    self._save_persistent_data()
+                    return
 
                 switch_state = self.get_state(self.peblar_switch_entity)
                 if switch_state in [None, "unavailable", "unknown"]:
@@ -1369,26 +1373,11 @@ class PeblarHorizonPlanner(hass.Hass):
                     self._set_state_respecting_minimum_off("Default", True, kw)
                 # Zonladen
                 elif zon_kwh > self.TOLERANCE:
-                    duration = next((u["duration_hours"] for u in self.matrix_kwartieren if u["tijd"] == huidig_kwartier), self.QUARTER_HOURS)
-                    kw = zon_kwh / duration if duration > 0 else 0.0
-                    self._set_state_respecting_minimum_off("Pure solar", True, kw)
-                # Zonladen altijd mogelijk
+                    self._set_solar_charging_state()
+                # Pure solar remains enabled between planned grid-charging slots;
+                # the Peblar itself pauses charging when there is no surplus.
                 else:
-                    actueel = next((u for u in self.matrix_kwartieren if u["tijd"] == huidig_kwartier), None)
-                    if actueel and actueel["laadbare_zon_kwh"] > self.TOLERANCE:
-                        duration = actueel.get("duration_hours", self.QUARTER_HOURS)
-                        kw = actueel["laadbare_zon_kwh"] / duration if duration > 0 else 0.0
-                        self._set_state_respecting_minimum_off("Pure solar", True, kw)
-                    else:
-                        if current_power_on and self.last_power_on_time is not None:
-                            run_duration = (nu - self.last_power_on_time).total_seconds() / 60.0
-                            if run_duration < self.MIN_RUN_MINUTES:
-                                self.log(
-                                    f"ANTI-PENDEL: minimale draaitijd, nog "
-                                    f"{self.MIN_RUN_MINUTES - run_duration:.1f} min."
-                                )
-                                return
-                        self._set_desired_state("Pure solar", False, 0.0)
+                    self._set_solar_charging_state()
 
             except Exception as e:
                 self.error(f"Fout in voer_schakeling_uit: {self._sanitize_error(e)}")

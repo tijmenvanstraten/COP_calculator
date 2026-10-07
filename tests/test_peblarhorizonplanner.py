@@ -23,6 +23,107 @@ class PeblarHorizonPlannerTests(unittest.TestCase):
         planner._lock = threading.RLock()
         return planner
 
+    def test_idle_connected_vehicle_keeps_solar_charging_enabled(self):
+        planner = self.make_planner()
+        planner.planning_geannuleerd = True
+        planner._plan_status = "geannuleerd"
+        planner.peblar_status_entity = "status"
+        planner.get_state = lambda entity: "charging" if entity == "status" else "off"
+        planner._desired_state_calls = []
+        planner._set_desired_state = lambda *args: planner._desired_state_calls.append(args)
+
+        planner.voer_schakeling_uit()
+
+        self.assertEqual(
+            planner._desired_state_calls,
+            [("Pure solar", True, planner.MAX_PAAL_KW)],
+        )
+
+    def test_unavailable_vehicle_status_does_not_force_charger_off(self):
+        planner = self.make_planner()
+        planner.peblar_status_entity = "status"
+        planner.get_state = lambda entity: "unavailable"
+        planner._desired_state_calls = []
+        planner._set_desired_state = lambda *args: planner._desired_state_calls.append(args)
+
+        planner._set_solar_charging_state()
+
+        self.assertEqual(planner._desired_state_calls, [])
+
+    def test_plugging_in_starts_solar_charging_without_a_plan(self):
+        planner = self.make_planner()
+        planner.planning_geannuleerd = False
+        planner._plan_status = "geen_plan"
+        planner.sessie_actief = False
+        planner.peblar_status_entity = "status"
+        planner.soc_entity = "soc"
+        planner.PLAN_UITVOEREN_BOOLEAN = "execution"
+        planner.get_state = lambda entity: {
+            "status": "suspended",
+            "execution": "off",
+        }.get(entity)
+        planner.get_sensor_float = lambda entity: 50.0
+        planner._desired_state_calls = []
+        planner._set_desired_state = lambda *args: planner._desired_state_calls.append(args)
+        planner._log_bij_verandering = lambda *args: None
+        planner.log = lambda *args, **kwargs: None
+
+        planner._auto_status_changed("status", None, "no_ev_connected", "suspended", {})
+
+        self.assertTrue(planner.sessie_actief)
+        self.assertEqual(
+            planner._desired_state_calls,
+            [("Pure solar", True, planner.MAX_PAAL_KW)],
+        )
+
+    def test_plan_completion_leaves_solar_charging_enabled(self):
+        planner = self.make_planner()
+        planner.planning_geannuleerd = False
+        planner._plan_status = "in_uitvoering"
+        planner.PLAN_UITVOEREN_BOOLEAN = "execution"
+        planner.peblar_status_entity = "status"
+        planner.soc_entity = "soc"
+        planner.peblar_energie_entity = "energy"
+        planner.matrix_kwartieren = [{"tijd": datetime.datetime.now(tz.UTC)}]
+        planner.plan = {}
+        planner.initiele_energie = 100.0
+        planner.cumulatief_geladen_kwh = 0.0
+        planner.sessie_doel_kwh = 10.0
+        planner.sessie_actief = True
+        planner.vorige_soc = None
+        planner.vorige_soc_energie = None
+        planner._sensor_storingen = 0
+        planner._set_execution_boolean_calls = []
+        planner._desired_state_calls = []
+        planner.get_state = lambda entity: {
+            "execution": "on",
+            "status": "charging",
+        }.get(entity, "off")
+        planner.get_sensor_float = lambda entity: {
+            "soc": 70.0,
+            "energy": 110.0,
+        }.get(entity)
+        planner._check_kritieke_sensoren = lambda **kwargs: True
+        planner._plan_afwijking_kwh = lambda *args: None
+        planner._set_execution_boolean = lambda enabled: planner._set_execution_boolean_calls.append(enabled)
+        planner._set_desired_state = lambda *args: planner._desired_state_calls.append(args)
+        planner._set_plan_status = lambda status, message=None: setattr(planner, "_plan_status", status)
+        planner._reset_laadtracking = lambda: None
+        planner._send_push_notification = lambda *args: None
+        planner._save_persistent_data = lambda: None
+        planner._log_bij_verandering = lambda *args: None
+        planner.log = lambda *args, **kwargs: None
+        planner.error = lambda *args, **kwargs: None
+
+        planner.voer_schakeling_uit()
+
+        self.assertEqual(planner._plan_status, "voltooid")
+        self.assertEqual(planner._set_execution_boolean_calls, [False])
+        self.assertEqual(
+            planner._desired_state_calls,
+            [("Pure solar", True, planner.MAX_PAAL_KW)],
+        )
+
     def test_plan_uses_gross_energy_after_charging_efficiency(self):
         planner = self.make_planner()
         for entity_key, entity_id in planner.DEFAULT_ENTITIES.items():
@@ -209,7 +310,7 @@ class PeblarHorizonPlannerTests(unittest.TestCase):
         planner._desired_state_calls = []
         planner._set_desired_state = lambda *args: None
         planner._set_execution_boolean = lambda enabled: planner._set_execution_boolean_calls.append(enabled)
-        planner._set_state_respecting_minimum_off = lambda *args: planner._desired_state_calls.append(args)
+        planner._set_desired_state = lambda *args: planner._desired_state_calls.append(args)
         planner._set_plan_status = lambda status, message=None: setattr(planner, "_plan_status", status)
         planner._plan_afwijking_kwh = lambda *args: None
         planner._is_auto_verbonden = lambda: True
@@ -222,7 +323,7 @@ class PeblarHorizonPlannerTests(unittest.TestCase):
             planner.PLAN_UITVOEREN_BOOLEAN: "on",
             planner.soc_entity: "unavailable",
             planner.peblar_energie_entity: "100",
-            planner.peblar_status_entity: "suspendedev",
+            planner.peblar_status_entity: "suspended",
             planner.peblar_switch_entity: "off",
             planner.peblar_mode_entity: "Pure solar",
         }
@@ -233,7 +334,10 @@ class PeblarHorizonPlannerTests(unittest.TestCase):
 
         self.assertEqual(planner._plan_status, "in_uitvoering")
         self.assertEqual(planner._set_execution_boolean_calls, [])
-        self.assertEqual(planner._desired_state_calls, [("Pure solar", True, 2.0)])
+        self.assertEqual(
+            planner._desired_state_calls,
+            [("Pure solar", True, planner.MAX_PAAL_KW)],
+        )
 
     def test_suspended_zero_power_status_keeps_session_active(self):
         planner = self.make_planner()
@@ -362,13 +466,14 @@ class PeblarHorizonPlannerTests(unittest.TestCase):
         planner._desired_power_on = True
         planner._last_switch_command_state = None
         planner.PLAN_UITVOEREN_BOOLEAN = "execution"
+        planner.peblar_status_entity = "status"
         planner._plan_start_time = object()
         planner._plan_start_meterstand = 100.0
         planner.last_power_on_time = None
         planner.last_power_off_time = None
         planner._control_generation = 0
         actions = []
-        planner.get_state = lambda entity: "on"
+        planner.get_state = lambda entity: "charging" if entity == "status" else "on"
         planner.log = lambda *args, **kwargs: None
         planner._set_execution_boolean = lambda enabled: actions.append(("execution", enabled))
         planner._set_plan_status = lambda status, message=None: actions.append(("status", status, message))
@@ -379,6 +484,7 @@ class PeblarHorizonPlannerTests(unittest.TestCase):
 
         self.assertIn(("execution", False), actions)
         self.assertTrue(any(action[:2] == ("status", "gepauzeerd") for action in actions))
+        self.assertIn(("desired", "Pure solar", True, planner.MAX_PAAL_KW), actions)
         self.assertIsNone(planner._plan_start_time)
         self.assertIsNone(planner._plan_start_meterstand)
 
@@ -387,10 +493,11 @@ class PeblarHorizonPlannerTests(unittest.TestCase):
         planner._plan_status = "in_uitvoering"
         planner._desired_power_on = False
         planner._last_switch_command_state = "off"
+        planner._last_switch_command_time = None
         planner.PLAN_UITVOEREN_BOOLEAN = "execution"
         planner.last_power_on_time = datetime.datetime.now(tz.UTC)
         planner.last_power_off_time = None
-        planner.get_state = lambda entity: "off"
+        planner.get_state = lambda entity: "on"
         planner._set_execution_boolean = lambda enabled: self.fail("Planned switch off paused execution.")
         planner._set_plan_status = lambda *args: self.fail("Planned switch off changed plan status.")
 
