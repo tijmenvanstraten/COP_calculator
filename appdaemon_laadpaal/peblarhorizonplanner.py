@@ -7,6 +7,19 @@ import re
 from typing import Dict, Optional, Any
 from dateutil import tz
 
+
+class PlanningAbort(Exception):
+    """Planning of plancorrectie kon niet worden afgerond (verwachte, afgehandelde situatie)."""
+
+    def __init__(self, reden: str, *, fout: bool = True,
+                 wacht_forecast: bool = False, afgekoppeld: bool = False):
+        super().__init__(reden)
+        self.reden = reden
+        self.fout = fout
+        self.wacht_forecast = wacht_forecast
+        self.afgekoppeld = afgekoppeld
+
+
 class PeblarHorizonPlanner(hass.Hass):
     # ===== CONFIGURATIE =====
     MAX_PAAL_KW = 11.0
@@ -29,10 +42,19 @@ class PeblarHorizonPlanner(hass.Hass):
     MAX_AMPERE = 16.0
     MAX_SOC_JUMP_PER_QUARTER = 10.0
     MIN_RUN_MINUTES = 30
+    MIN_OFF_MINUTES = 10
+    MAX_SENSOR_STORING_KWARTIEREN = 3
+    SWITCH_COMMAND_GRACE_SECONDS = 30
     MIN_LAADVERMOGEN_ZON_KW = 1.38
     GRAPH_ATTRIBUTE_MAX_BYTES = 16000
-    PROGRESS_UPDATE_DEBOUNCE_SECONDS = 5
+    PROGRESS_UPDATE_DEBOUNCE_SECONDS = 60
     PROGRESS_UPDATE_MIN_DELTA_KWH = 0.01
+
+    # Peblar CP-status (sensor.peblar_ev_charger_status, HA Peblar-integratie).
+    # Overschrijfbaar via apps.yaml: status_verbonden / status_losgekoppeld / status_storing
+    STATUS_VERBONDEN = ("charging", "suspended")
+    STATUS_LOSGEKOPPELD = ("no_ev_connected",)
+    STATUS_STORING = ("error", "fault", "invalid")
 
     # Energie core forecast
     FORECAST_MAX_AGE_MINUTES = 45
@@ -58,7 +80,6 @@ class PeblarHorizonPlanner(hass.Hass):
         "peblar_mode_entity": "select.peblar_ev_charger_slim_laden",
         "peblar_laadlimiet_entity": "number.peblar_ev_charger_laadlimiet",
         "peblar_status_entity": "sensor.peblar_ev_charger_status",
-        "peblar_power_entity": "sensor.peblar_ev_charger_laadvermogen",
         "push_notification_entity": "notify.mobile_app_iphone",
         "plan_bereken_button_entity": "input_button.ford_capri_ev_start_laadplan_berekening",
         "plan_uitvoeren_boolean_entity": "input_boolean.ford_capri_ev_uitvoeren_laadplan",
@@ -70,7 +91,7 @@ class PeblarHorizonPlanner(hass.Hass):
     LOCAL_TZ_NAME = "Europe/Amsterdam"
 
     def initialize(self):
-        self.log("Peblar Horizon Planner v11 (core forecast) opgestart.")
+        self.log("Peblar Horizon Planner v12 (core forecast) opgestart.")
         self._lock = threading.RLock()
         self._load_configuration()
         self._local_tz = tz.gettz(self.LOCAL_TZ_NAME)
@@ -80,7 +101,6 @@ class PeblarHorizonPlanner(hass.Hass):
         self.plan = {}
         self.matrix_kwartieren = []
         self.last_plan_calculation = None
-        self.plan_valid_until = None
         self._plan_start_time = None
         self._plan_start_meterstand = None
         self.doel_soc = None
@@ -92,8 +112,6 @@ class PeblarHorizonPlanner(hass.Hass):
         self.sessie_actief = False
         self.vorige_soc = None
         self.vorige_soc_energie = None
-        self.vorige_laadvermogen = None
-        self.last_soc_update = None
         self.last_mode_call = None
         self.last_switch_call = None
         self.last_laadlimiet_call = None
@@ -104,12 +122,14 @@ class PeblarHorizonPlanner(hass.Hass):
         self._pending_control_timer = None
         self._minimum_off_timer = None
         self._progress_update_timer = None
+        self._sensor_storingen = 0
+        self._last_switch_command_time = None
+        self._graph_page_counts = {}
         self._last_progress_kwh = None
         self._last_switch_command_state = None
         self.planning_geannuleerd = False
         self._plan_status = "geen_plan"
         self._plan_message = None
-        self._plan_berekenen_bezig = False
         self._forecast_alarm_sent = False
         self._wacht_op_forecast = False
         self._forecast_status = None
@@ -155,7 +175,8 @@ class PeblarHorizonPlanner(hass.Hass):
         geladen_kwh = self._finite_nonnegative(self.cumulatief_geladen_kwh)
         initiele_energie = self._finite_nonnegative(self.initiele_energie)
         sessie_geldig = (
-            self.sessie_actief
+            status in ("concept", "in_uitvoering", "gepauzeerd")
+            and self.sessie_actief
             and initiele_energie is not None
             and doel_kwh is not None
             and geladen_kwh is not None
@@ -225,7 +246,6 @@ class PeblarHorizonPlanner(hass.Hass):
             self.cumulatief_geladen_kwh = max(0.0, huidige_energie - self.initiele_energie)
             self._last_progress_kwh = self.cumulatief_geladen_kwh
             self._set_plan_status(self._plan_status, self._plan_message)
-            self._save_persistent_data()
 
     def _cancel_progress_update_timer(self):
         timer = getattr(self, "_progress_update_timer", None)
@@ -253,24 +273,20 @@ class PeblarHorizonPlanner(hass.Hass):
     def _plan_berekenen_ingedrukt(self, entity, attribute, old, new, kwargs):
         with self._lock:
             self.planning_geannuleerd = False
-            self._plan_berekenen_bezig = True
             self._set_execution_boolean(False)
             self._set_desired_state("Pure solar", False, 0.0)
             self._set_plan_status("berekenen")
             self.last_plan_calculation = None
-            try:
-                self.bereken_laadplan()
-                if self.last_plan_calculation is not None:
-                    self._set_plan_status("concept", "Wacht op goedkeuring via de uitvoerschakelaar.")
-                elif self._wacht_op_forecast:
-                    self._set_plan_status("wacht_op_forecast", "Forecast beschikbaar? Bereken het plan opnieuw via de knop.")
-                elif not self._is_auto_verbonden():
-                    self._set_plan_status("wacht_op_auto", "Sluit de auto aan en bereken het plan opnieuw.")
-                    self._set_execution_boolean(False)
-                else:
-                    self._set_plan_status("fout", "Geen bruikbaar conceptplan berekend.")
-            finally:
-                self._plan_berekenen_bezig = False
+            self.bereken_laadplan()
+            if self.last_plan_calculation is not None:
+                self._set_plan_status("concept", "Wacht op goedkeuring via de uitvoerschakelaar.")
+            elif self._wacht_op_forecast:
+                self._set_plan_status("wacht_op_forecast", "Forecast beschikbaar? Bereken het plan opnieuw via de knop.")
+            elif not self._is_auto_verbonden():
+                self._set_plan_status("wacht_op_auto", "Sluit de auto aan en bereken het plan opnieuw.")
+                self._set_execution_boolean(False)
+            else:
+                self._set_plan_status("fout", "Geen bruikbaar conceptplan berekend.")
 
     def _uitvoering_boolean_gewijzigd(self, entity, attribute, old, new, kwargs):
         with self._lock:
@@ -309,7 +325,9 @@ class PeblarHorizonPlanner(hass.Hass):
             self._plan_start_meterstand = huidige_energie
             if self._finite_nonnegative(self.initiele_energie) is not None:
                 self._last_progress_kwh = self.cumulatief_geladen_kwh
-            self.plan_valid_until = nu + datetime.timedelta(minutes=self.PLAN_VALIDITY_MINUTES)
+            # Bewuste start/hervatting door de gebruiker: geen minimale uit-tijd afwachten
+            self.last_power_off_time = None
+            self._cancel_minimum_off_timer()
             self._set_plan_status("in_uitvoering")
             self.voer_schakeling_uit()
 
@@ -354,6 +372,12 @@ class PeblarHorizonPlanner(hass.Hass):
         self.LAADRENDEMENT = float(self.args.get("laadrendement", self.LAADRENDEMENT))
         self.MAX_SOC_JUMP_PER_QUARTER = float(self.args.get("max_soc_jump", self.MAX_SOC_JUMP_PER_QUARTER))
         self.MIN_RUN_MINUTES = int(self.args.get("min_run_minutes", self.MIN_RUN_MINUTES))
+        self.MIN_OFF_MINUTES = int(self.args.get("min_off_minutes", self.MIN_OFF_MINUTES))
+        self.MAX_SENSOR_STORING_KWARTIEREN = max(1, int(self.args.get(
+            "max_sensor_storing_kwartieren", self.MAX_SENSOR_STORING_KWARTIEREN)))
+        self.STATUS_VERBONDEN = self._status_lijst("status_verbonden", self.STATUS_VERBONDEN)
+        self.STATUS_LOSGEKOPPELD = self._status_lijst("status_losgekoppeld", self.STATUS_LOSGEKOPPELD)
+        self.STATUS_STORING = self._status_lijst("status_storing", self.STATUS_STORING)
         self.MIN_LAADVERMOGEN_ZON_KW = float(self.args.get("min_laadvermogen_zon_kw", self.MIN_LAADVERMOGEN_ZON_KW))
         self.PERSISTENCE_ENTITY = self.args.get("persistence_entity", self.PERSISTENCE_ENTITY)
         self.PERSISTENCE_ENABLED = bool(self.args.get("persistence_enabled", self.PERSISTENCE_ENABLED))
@@ -429,6 +453,7 @@ class PeblarHorizonPlanner(hass.Hass):
                     f"Forecast status '{self._forecast_status}': {attrs.get('waarschuwingen')}")
             else:
                 self._log_bij_verandering("forecast_status", None)
+
     def _log_bij_verandering(self, sleutel: str, melding: Optional[str]):
         vorige = self._gelogde_meldingen.get(sleutel)
         if melding:
@@ -479,7 +504,7 @@ class PeblarHorizonPlanner(hass.Hass):
             if not self._forecast_alarm_sent:
                 self._forecast_alarm_sent = True
                 self._send_push_notification("Forecast Verouderd",
-                                             f"Energie core forecast is {leeftijd_min:.0f} minuten oud. Laden gestopt.")
+                                             f"Energie core forecast is {leeftijd_min:.0f} minuten oud. Planning wordt niet (her)berekend.")
             return None
         self._forecast_alarm_sent = False
 
@@ -515,7 +540,6 @@ class PeblarHorizonPlanner(hass.Hass):
         with self._lock:
             self.plan = {}
             self.matrix_kwartieren = []
-            self.plan_valid_until = None
             self._plan_start_time = None
             self._plan_start_meterstand = None
             self.last_plan_calculation = None
@@ -536,6 +560,7 @@ class PeblarHorizonPlanner(hass.Hass):
             self.last_power_off_time = None
             self._plan_start_time = None
             self._plan_start_meterstand = None
+            self._sensor_storingen = 0
 
     def _send_push_notification(self, title: str, message: str):
         if hasattr(self, 'push_notification_entity') and self.push_notification_entity:
@@ -554,6 +579,7 @@ class PeblarHorizonPlanner(hass.Hass):
         self,
         include_vehicle_sensors: bool = True,
         include_status_sensor: bool = True,
+        melden: bool = True,
     ) -> bool:
         kritieke_sensoren = [
             self.peblar_energie_entity,
@@ -567,8 +593,11 @@ class PeblarHorizonPlanner(hass.Hass):
         for sensor in kritieke_sensoren:
             state = self.get_state(sensor)
             if state is None or str(state).lower() in ["unavailable", "unknown"]:
-                self.error(f"Kritieke sensor onbeschikbaar: {sensor}")
-                self._send_push_notification("Peblar Fout", f"Kritieke sensor onbeschikbaar: {sensor}")
+                if melden:
+                    self.error(f"Kritieke sensor onbeschikbaar: {sensor}")
+                    self._send_push_notification("Peblar Fout", f"Kritieke sensor onbeschikbaar: {sensor}")
+                else:
+                    self.warning(f"Kritieke sensor onbeschikbaar: {sensor}")
                 return False
         return True
 
@@ -580,8 +609,13 @@ class PeblarHorizonPlanner(hass.Hass):
             elif old != "on" and new == "on":
                 self.last_power_on_time = datetime.datetime.now(tz.UTC)
             if new == self._last_switch_command_state:
+                commando_tijd = self._last_switch_command_time
                 self._last_switch_command_state = None
-                return
+                self._last_switch_command_time = None
+                if (commando_tijd is not None and
+                        (datetime.datetime.now(tz.UTC) - commando_tijd).total_seconds()
+                        <= self.SWITCH_COMMAND_GRACE_SECONDS):
+                    return
             if self._plan_status != "in_uitvoering" or str(
                 self.get_state(self.PLAN_UITVOEREN_BOOLEAN) or ""
             ).lower() != "on":
@@ -614,7 +648,7 @@ class PeblarHorizonPlanner(hass.Hass):
             return
         if self.get_state(self.peblar_switch_entity) != "on" and self.last_power_off_time is not None:
             elapsed = (datetime.datetime.now(tz.UTC) - self.last_power_off_time).total_seconds() / 60.0
-            remaining = self.MIN_RUN_MINUTES - elapsed
+            remaining = self.MIN_OFF_MINUTES - elapsed
             if remaining > 0:
                 if self._minimum_off_timer is None:
                     self._minimum_off_timer = self.run_in(
@@ -673,6 +707,7 @@ class PeblarHorizonPlanner(hass.Hass):
         with self._lock:
             self.voer_schakeling_uit()
             self._update_graph_data()
+            self._save_persistent_data()
         self._schedule_kwartier_timer()
 
     def _plan_afwijking_kwh(self, huidige_energie: float, nu: datetime.datetime) -> Optional[float]:
@@ -700,16 +735,29 @@ class PeblarHorizonPlanner(hass.Hass):
         with self._lock:
             if self.planning_geannuleerd:
                 return
-            status = str(new).lower() if new is not None else ""
-            if status in ("unknown", "unavailable", ""):
+            klasse = self._status_klasse(new)
+            if klasse == "niet_beschikbaar":
                 self._log_bij_verandering(
                     "peblar_status",
-                    f"Peblar-status tijdelijk niet beschikbaar ('{status or 'None'}'); "
+                    f"Peblar-status tijdelijk niet beschikbaar ('{new}'); "
                     "sessie blijft behouden tot statusherstel.",
                 )
                 return
+            if klasse == "storing":
+                self._log_bij_verandering(
+                    "peblar_status", f"Peblar meldt status '{new}'; sessie blijft behouden.")
+                if str(new).lower() in ("error", "fault"):
+                    self._send_push_notification("Laadpaal Storing", f"Peblar-status: {new}")
+                return
+            if klasse == "onbekend":
+                self._log_bij_verandering(
+                    "peblar_status",
+                    f"Onbekende Peblar-status '{new}'; sessie blijft behouden. "
+                    "Controleer status_verbonden/status_losgekoppeld in de configuratie.",
+                )
+                return
             self._log_bij_verandering("peblar_status", None)
-            if status == "available":
+            if klasse == "losgekoppeld":
                 self.log(f"Auto losgekoppeld (status: {new}). Harde stop.")
                 self._send_push_notification("Auto Losgekoppeld", f"Auto is losgekoppeld. Status: {new}")
                 self._set_execution_boolean(False)
@@ -718,19 +766,15 @@ class PeblarHorizonPlanner(hass.Hass):
                 self._clear_plan()
                 self._set_plan_status("opnieuw_berekenen", "Auto losgekoppeld; maak na opnieuw aansluiten een nieuw plan.")
                 self._save_persistent_data()
-            elif status in ["preparing", "charging", "suspendedev", "suspendedevse", "finishing"]:
+            else:  # verbonden: 'charging' of 'suspended' (0 W is normaal tijdens een sessie)
                 huidige_soc = self.get_sensor_float(self.soc_entity)
                 if not self.sessie_actief:
                     self.sessie_actief = True
                     self.initiele_energie = None
                     self.vorige_soc = huidige_soc
+                    self.vorige_soc_energie = None
                     self.planning_geannuleerd = False
                     self.log(f"Auto verbonden (status: {new}). Nieuwe sessie gestart, SoC={huidige_soc}%")
-            else:
-                self._log_bij_verandering(
-                    "peblar_status",
-                    f"Onbekende Peblar-status '{status}'; sessie blijft behouden.",
-                )
 
     def _sanitize_error(self, error: Exception) -> str:
         error_str = str(error)
@@ -767,11 +811,29 @@ class PeblarHorizonPlanner(hass.Hass):
         except (ValueError, TypeError):
             return default
 
+    def _status_lijst(self, sleutel: str, standaard) -> tuple:
+        waarde = self.args.get(sleutel)
+        if waarde is None:
+            return tuple(standaard)
+        if isinstance(waarde, str):
+            waarde = waarde.split(",")
+        return tuple(str(item).strip().lower() for item in waarde if str(item).strip())
+
+    def _status_klasse(self, status) -> str:
+        """Deelt een Peblar-status in: verbonden / losgekoppeld / storing / niet_beschikbaar / onbekend."""
+        tekst = str(status).strip().lower() if status is not None else ""
+        if tekst in ("", "none", "unavailable", "unknown"):
+            return "niet_beschikbaar"
+        if tekst in self.STATUS_VERBONDEN:
+            return "verbonden"
+        if tekst in self.STATUS_LOSGEKOPPELD:
+            return "losgekoppeld"
+        if tekst in self.STATUS_STORING:
+            return "storing"
+        return "onbekend"
+
     def _is_auto_verbonden(self) -> bool:
-        status = self.get_state(self.peblar_status_entity)
-        if status is None or str(status).lower() in ["unavailable", "unknown", "available"]:
-            return False
-        return str(status).lower() in ["preparing", "charging", "suspendedev", "suspendedevse", "finishing"]
+        return self._status_klasse(self.get_state(self.peblar_status_entity)) == "verbonden"
 
     def _ampere_naar_kw(self, ampere: float) -> float:
         if self.FASEN == 1:
@@ -794,235 +856,271 @@ class PeblarHorizonPlanner(hass.Hass):
             and vermogen_kw >= self.MIN_LAADVERMOGEN_ZON_KW
         )
 
-    def bereken_laadplan(self, concept: bool = True):
+    _SNAPSHOT_ATTRS = (
+        "plan", "matrix_kwartieren", "last_plan_calculation", "_plan_start_time",
+        "_plan_start_meterstand", "doel_soc", "sessie_doel_kwh", "cumulatief_geladen_kwh",
+        "initiele_energie", "_last_progress_kwh", "sessie_actief", "vorige_soc", "vorige_soc_energie",
+    )
+
+    def _plan_snapshot(self) -> Dict[str, Any]:
+        return {naam: getattr(self, naam) for naam in self._SNAPSHOT_ATTRS}
+
+    def _plan_herstellen(self, snapshot: Dict[str, Any]):
+        for naam, waarde in snapshot.items():
+            setattr(self, naam, waarde)
+
+    def _effectieve_soc(self, soc: float, meterstand: float) -> float:
+        """Beste SoC-schatting. FordPass blijft leidend; is de waarde sinds de laatste
+        wijziging niet bijgewerkt terwijl er wel is geladen, dan wordt de SoC geschat
+        uit de Peblar-meter (verouderde FordPass-waarde)."""
+        if self.vorige_soc is None or self.vorige_soc_energie is None:
+            return soc
+        if abs(soc - self.vorige_soc) > self.TOLERANCE:
+            return soc
+        geladen_kwh = max(0.0, meterstand - self.vorige_soc_energie)
+        schatting = min(100.0, soc + geladen_kwh * self.LAADRENDEMENT / self.ACCU_CAP_KWH * 100.0)
+        if schatting - soc >= 0.5:
+            self._log_bij_verandering(
+                "soc_schatting",
+                f"FordPass-SoC ({soc:.0f}%) lijkt verouderd; geschat op {schatting:.1f}% via de Peblar-meter.")
+        else:
+            self._log_bij_verandering("soc_schatting", None)
+        return schatting
+
+    def _registreer_soc(self, soc: float, meterstand: float):
+        """Onthoudt de laatst gemelde FordPass-SoC met de bijbehorende meterstand
+        (alleen bij een gewijzigde waarde, zodat een verouderde waarde herkenbaar blijft)."""
+        if (self.vorige_soc is None or self.vorige_soc_energie is None
+                or abs(soc - self.vorige_soc) > self.TOLERANCE):
+            self.vorige_soc = soc
+            self.vorige_soc_energie = meterstand
+
+    def _parse_vertrektijd(self, tijd_str: str) -> datetime.datetime:
+        attrs = self.get_state(self.vertrektijd_entity, attribute="all")
+        attributes = (attrs or {}).get("attributes", {}) or {}
+        has_date = attributes.get("has_date", False)
+        has_time = attributes.get("has_time", False)
+        try:
+            if has_date and has_time:
+                try:
+                    lokaal = datetime.datetime.strptime(tijd_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=self._local_tz)
+                except ValueError:
+                    lokaal = datetime.datetime.fromisoformat(tijd_str).replace(tzinfo=self._local_tz)
+            elif has_time:
+                lokale_nu = datetime.datetime.now(self._local_tz)
+                tijd_obj = datetime.datetime.strptime(tijd_str, "%H:%M:%S").time()
+                lokaal = lokale_nu.replace(hour=tijd_obj.hour, minute=tijd_obj.minute, second=0, microsecond=0)
+                if lokaal <= lokale_nu:
+                    lokaal += datetime.timedelta(days=1)
+            else:
+                raise PlanningAbort("Vertrektijd heeft geen datum/tijd!")
+        except ValueError:
+            raise PlanningAbort(f"Kan vertrektijd niet parsen: {tijd_str}")
+        return lokaal.astimezone(tz.UTC)
+
+    def _bouw_matrix(self, forecast, nu: datetime.datetime, vertrektijd: datetime.datetime):
+        matrix = []
+        ontbrekend = 0
+        nu_rounded = nu.replace(second=0, microsecond=0, tzinfo=tz.UTC)
+        slot_start = nu_rounded.replace(minute=(nu_rounded.minute // 15) * 15)
+
+        while slot_start < vertrektijd:
+            slot_end = slot_start + datetime.timedelta(minutes=15)
+            remaining_to_vertrek = (vertrektijd - slot_start).total_seconds()
+            if remaining_to_vertrek <= 0:
+                break
+
+            if slot_start < nu:
+                available_end = min(slot_end, vertrektijd)
+                slot_duration_sec = max(0, (available_end - nu).total_seconds())
+            else:
+                slot_duration_sec = min(self.SECONDS_PER_QUARTER, remaining_to_vertrek)
+            duration_hours = slot_duration_sec / 3600.0
+
+            fc_slot = forecast.get(slot_start)
+            if fc_slot is None:
+                ontbrekend += 1
+                fc_slot = {
+                    "pv_kw": 0.0,
+                    "verbruik_kw": self.FALLBACK_VERBRUIK_KW,
+                    "epex_prijs": 0.0,
+                    "net_prijs": self.FALLBACK_NET_PRIJS,
+                    "prijs_bron": "fallback",
+                }
+
+            verbruik_kw = fc_slot["verbruik_kw"]
+            pv_kw = fc_slot["pv_kw"] if duration_hours > 0 else 0.0
+            base_import_kw = max(0.0, verbruik_kw - pv_kw)
+            solar_surplus_kw = max(0.0, pv_kw - verbruik_kw)
+            zon_laad_kw = min(self.MAX_PAAL_KW, solar_surplus_kw)
+            laadbare_zon_kwh = zon_laad_kw * duration_hours
+
+            if not self._zonoverschot_bruikbaar(zon_laad_kw, laadbare_zon_kwh):
+                laadbare_zon_kwh = 0.0
+                zon_laad_kw = 0.0
+
+            rest_paal_kw = self.MAX_PAAL_KW - zon_laad_kw
+            max_net_kw = min(rest_paal_kw, max(0.0, self.MAX_GROEP_KW - base_import_kw))
+            max_net_kwh_kwartier = max_net_kw * duration_hours
+
+            matrix.append({
+                "tijd": slot_start,
+                "duration_hours": duration_hours,
+                "laadbare_zon_kwh": laadbare_zon_kwh,
+                "max_net_kwh": max_net_kwh_kwartier,
+                "net_prijs": fc_slot["net_prijs"],
+                "epex_prijs": fc_slot["epex_prijs"],
+                "pv_kw": fc_slot["pv_kw"],
+                "verbruik_kw": verbruik_kw,
+                "prijs_bron": fc_slot["prijs_bron"],
+            })
+            slot_start = slot_end
+        return matrix, ontbrekend
+
+    def bereken_laadplan(self, concept: bool = True) -> bool:
+        """Berekent het laadplan; True bij succes.
+
+        concept=True : nieuw conceptplan (knop). Bij mislukken wordt de paal veilig gestopt
+                       en de sessie gereset.
+        concept=False: correctie tijdens uitvoering. Bij mislukken (bv. FordPass of forecast
+                       onbeschikbaar) blijft het bestaande plan ongewijzigd actief.
+        """
         with self._lock:
+            if self.planning_geannuleerd:
+                self.log("Planning is geannuleerd, geen herberekening.")
+                return False
+            snapshot = self._plan_snapshot()
             try:
-                if self.planning_geannuleerd:
-                    self.log("Planning is geannuleerd, geen herberekening.")
-                    return
-                if not self._check_kritieke_sensoren():
-                    self._set_desired_state("Pure solar", False, 0.0)
-                    self._reset_laadtracking()
-                    self._save_persistent_data()
-                    return
-                self._clear_plan()
-                tijd_str = self.get_state(self.vertrektijd_entity)
-                if tijd_str is None:
-                    self.error("Vertrektijd is None! Stoppen.")
-                    self._set_desired_state("Pure solar", False, 0.0)
-                    self._reset_laadtracking()
-                    self._save_persistent_data()
-                    return
-
-                attrs = self.get_state(self.vertrektijd_entity, attribute="all")
-                attributes = (attrs or {}).get("attributes", {}) or {}
-                has_date = attributes.get("has_date", False)
-                has_time = attributes.get("has_time", False)
-
-                # Parse vertrektijd (datum + tijd of alleen tijd)
-                if has_date and has_time:
-                    try:
-                        vertrektijd_local = datetime.datetime.strptime(tijd_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=self._local_tz)
-                    except ValueError:
-                        try:
-                            vertrektijd_local = datetime.datetime.fromisoformat(tijd_str).replace(tzinfo=self._local_tz)
-                        except ValueError:
-                            self.error(f"Kan vertrektijd niet parsen: {tijd_str}")
-                            self._set_desired_state("Pure solar", False, 0.0)
-                            self._reset_laadtracking()
-                            self._save_persistent_data()
-                            return
-                    vertrektijd = vertrektijd_local.astimezone(tz.UTC)
-                elif has_time:
-                    lokale_nu = datetime.datetime.now(self._local_tz)
-                    tijd_obj = datetime.datetime.strptime(tijd_str, "%H:%M:%S").time()
-                    vertrektijd_local = lokale_nu.replace(hour=tijd_obj.hour, minute=tijd_obj.minute, second=0, microsecond=0)
-                    if vertrektijd_local <= lokale_nu:
-                        vertrektijd_local += datetime.timedelta(days=1)
-                    vertrektijd = vertrektijd_local.astimezone(tz.UTC)
-                else:
-                    self.error("Vertrektijd heeft geen datum/tijd!")
-                    self._set_desired_state("Pure solar", False, 0.0)
-                    self._reset_laadtracking()
-                    self._save_persistent_data()
-                    return
-
-                nu = datetime.datetime.now(tz.UTC)
-                if vertrektijd <= nu:
-                    self.log("Vertrektijd in verleden. Standby.")
-                    self._set_desired_state("Pure solar", False, 0.0)
-                    self._reset_laadtracking()
-                    self._save_persistent_data()
-                    return
-
-                if not self._is_auto_verbonden():
-                    self.log("Geen auto verbonden. Standby.")
-                    self._set_execution_boolean(False)
-                    self._set_desired_state("Pure solar", False, 0.0)
-                    self._reset_laadtracking()
-                    self._clear_plan()
-                    self._set_plan_status("opnieuw_berekenen", "Auto losgekoppeld; maak na opnieuw aansluiten een nieuw plan.")
-                    self._save_persistent_data()
-                    return
-
-                # Bereken doel SoC en netto behoefte
-                gewenste_km = self.get_sensor_float(self.gewenste_km_entity)
-                huidig_bereik = self.get_sensor_float(self.bereik_entity)
-                huidige_soc = self.get_sensor_float(self.soc_entity)
-                if None in [gewenste_km, huidig_bereik, huidige_soc]:
-                    self.error("Kritieke sensoren ontbreken!")
-                    self._set_desired_state("Pure solar", False, 0.0)
-                    self._reset_laadtracking()
-                    self._save_persistent_data()
-                    return
-
-                km_per_procent = (huidig_bereik / huidige_soc if huidige_soc > 0 and huidig_bereik > 0 else self.FALLBACK_KM_PER_PERCENT)
-                doel_soc = max(self.MIN_SOC_SAFETY, min(100.0, (gewenste_km / km_per_procent) + self.VEILIGHEIDSMARGE_PERCENT))
-                netto_behoefte_kwh = max(0.0, ((doel_soc - huidige_soc) / 100.0) * self.ACCU_CAP_KWH)
-                self.log(f"SoC: {huidige_soc}% -> {doel_soc:.1f}% (+{self.VEILIGHEIDSMARGE_PERCENT}% marge). Netladen behoefte: {netto_behoefte_kwh:.2f} kWh")
-
-                huidige_energie = self.get_sensor_float(self.peblar_energie_entity)
-                if huidige_energie is None:
-                    self.error("Energie sensor ongeldig!")
-                    self._set_desired_state("Pure solar", False, 0.0)
-                    self._reset_laadtracking()
-                    self._save_persistent_data()
-                    return
-
-                laad_behoefte_kwh = netto_behoefte_kwh / self.LAADRENDEMENT
-                self._cancel_progress_update_timer()
-                self.initiele_energie = max(0.0, huidige_energie)
-                self.cumulatief_geladen_kwh = 0.0
-                self._last_progress_kwh = 0.0
-                self.sessie_actief = True
-                self.sessie_doel_kwh = laad_behoefte_kwh
-                self.doel_soc = doel_soc
-                self.vorige_soc = huidige_soc
-                self.vorige_soc_energie = huidige_energie
-                self.log(f"Sessiebaseline bijgewerkt: initiele energie = {self.initiele_energie:.2f} kWh, SoC = {huidige_soc}%")
-
-                # Lees matrix uit energie core forecast
-                forecast = self._lees_forecast()
-                if forecast is None:
-                    self._wacht_op_forecast = True
-                    self._set_desired_state("Pure solar", False, 0.0)
-                    self._save_persistent_data()
-                    return
-                self._wacht_op_forecast = False
-
-                self.matrix_kwartieren = []
-                ontbrekend = 0
-                nu_rounded = nu.replace(second=0, microsecond=0, tzinfo=tz.UTC)
-                slot_start = nu_rounded.replace(minute=(nu_rounded.minute // 15) * 15)
-
-                while slot_start < vertrektijd:
-                    slot_end = slot_start + datetime.timedelta(minutes=15)
-                    remaining_to_vertrek = (vertrektijd - slot_start).total_seconds()
-                    if remaining_to_vertrek <= 0:
-                        break
-
-                    if slot_start < nu:
-                        available_end = min(slot_end, vertrektijd)
-                        slot_duration_sec = max(0, (available_end - nu).total_seconds())
-                    else:
-                        slot_duration_sec = min(self.SECONDS_PER_QUARTER, remaining_to_vertrek)
-                    duration_hours = slot_duration_sec / 3600.0
-
-                    fc_slot = forecast.get(slot_start)
-                    if fc_slot is None:
-                        ontbrekend += 1
-                        fc_slot = {
-                            "pv_kw": 0.0,
-                            "verbruik_kw": self.FALLBACK_VERBRUIK_KW,
-                            "epex_prijs": 0.0,
-                            "net_prijs": self.FALLBACK_NET_PRIJS,
-                            "prijs_bron": "fallback",
-                        }
-
-                    verbruik_kw = fc_slot["verbruik_kw"]
-                    pv_kw = fc_slot["pv_kw"] if duration_hours > 0 else 0.0
-                    base_import_kw = max(0.0, verbruik_kw - pv_kw)
-                    solar_surplus_kw = max(0.0, pv_kw - verbruik_kw)
-                    zon_laad_kw = min(self.MAX_PAAL_KW, solar_surplus_kw)
-                    laadbare_zon_kwh = zon_laad_kw * duration_hours
-
-                    if not self._zonoverschot_bruikbaar(zon_laad_kw, laadbare_zon_kwh):
-                        laadbare_zon_kwh = 0.0
-                        zon_laad_kw = 0.0
-
-                    rest_paal_kw = self.MAX_PAAL_KW - zon_laad_kw
-                    max_net_kw = min(rest_paal_kw, max(0.0, self.MAX_GROEP_KW - base_import_kw))
-                    max_net_kwh_kwartier = max_net_kw * duration_hours
-
-                    self.matrix_kwartieren.append({
-                        "tijd": slot_start,
-                        "duration_hours": duration_hours,
-                        "laadbare_zon_kwh": laadbare_zon_kwh,
-                        "max_net_kwh": max_net_kwh_kwartier,
-                        "net_prijs": fc_slot["net_prijs"],
-                        "epex_prijs": fc_slot["epex_prijs"],
-                        "pv_kw": fc_slot["pv_kw"],
-                        "verbruik_kw": verbruik_kw,
-                        "prijs_bron": fc_slot["prijs_bron"],
-                    })
-                    slot_start = slot_end
-
-                if ontbrekend > 0:
-                    self._log_bij_verandering("forecast_ontbreekt",
-                                              f"{ontbrekend} kwartier(en) niet in forecast, fallbackwaarden gebruikt.")
-                else:
-                    self._log_bij_verandering("forecast_ontbreekt", None)
-
-                fallback_kwartieren = [u for u in self.matrix_kwartieren if u["prijs_bron"] == "fallback"]
-                if fallback_kwartieren:
-                    eerste_fallback = fallback_kwartieren[0]["tijd"].astimezone(self._local_tz).strftime("%d-%m %H:%M")
-                    self._log_bij_verandering(
-                        "fallback_prijzen",
-                        f"{len(fallback_kwartieren)} van {len(self.matrix_kwartieren)} kwartieren tot vertrektijd gebruiken "
-                        f"een fallbackprijs (eerste: {eerste_fallback}). De planning is daar minder betrouwbaar.")
-                else:
-                    self._log_bij_verandering("fallback_prijzen", None)
-
-                # Plan zonladen en netladen
-                if laad_behoefte_kwh > self.TOLERANCE:
-                    totale_capaciteit = sum(u["laadbare_zon_kwh"] + u["max_net_kwh"] for u in self.matrix_kwartieren)
-                    if totale_capaciteit < laad_behoefte_kwh - self.TOLERANCE:
-                        self.error(f"Onvoldoende capaciteit: {totale_capaciteit:.2f} kWh beschikbaar.")
-                        self._set_desired_state("Pure solar", False, 0.0)
-                        self._reset_laadtracking()
-                        self._save_persistent_data()
-                        return
-                    if not self._bereken_geintegreerd_plan(laad_behoefte_kwh):
-                        self._plan_zo_veel_mogelijk(laad_behoefte_kwh)
-                else:
-                    self._bereken_zonladen_plan()
-
-                if self.plan:
-                    start = min(self.plan.keys()).strftime("%Y-%m-%d %H:%M")
-                    end = max(self.plan.keys()).strftime("%Y-%m-%d %H:%M")
-                    zon_total = sum(v['zon_kwh'] for v in self.plan.values())
-                    net_total = sum(v['net_kwh'] for v in self.plan.values())
-                    self.log(f"Plan: {start}–{end} | Zon: {zon_total:.2f} kWh | Net: {net_total:.2f} kWh")
-                else:
-                    self.log("Geen netladen nodig, alleen zonladen.")
-
-                self.last_plan_calculation = nu
-                self.plan_valid_until = nu + datetime.timedelta(minutes=self.PLAN_VALIDITY_MINUTES)
-                if concept:
-                    self._set_plan_status("concept", "Wacht op goedkeuring via de uitvoerschakelaar.")
-                else:
-                    self._plan_start_time = nu
-                    self._plan_start_meterstand = huidige_energie
-                    self._set_plan_status("in_uitvoering")
-                self._save_persistent_data()
-                self._update_graph_data()
-
+                self._bereken_laadplan_uitvoeren(concept)
+                self._log_bij_verandering("plancorrectie", None)
+                return True
+            except PlanningAbort as abort:
+                self._plan_afgebroken(abort, concept, snapshot)
             except Exception as e:
                 self.error(f"Fout in bereken_laadplan: {self._sanitize_error(e)}")
-                self._clear_plan()
-                self._set_desired_state("Pure solar", False, 0.0)
-                self._reset_laadtracking()
-                self._save_persistent_data()
+                self._plan_afgebroken(PlanningAbort("Interne fout bij plannen."), concept, snapshot, gelogd=True)
+            return False
+
+    def _plan_afgebroken(self, abort: PlanningAbort, concept: bool, snapshot: Dict[str, Any], gelogd: bool = False):
+        if not concept:
+            self._plan_herstellen(snapshot)
+            self._log_bij_verandering(
+                "plancorrectie",
+                f"Plancorrectie niet mogelijk ({abort.reden}); bestaand plan blijft actief.")
+            return
+        if not gelogd:
+            if abort.fout:
+                self.error(abort.reden)
+            else:
+                self.log(abort.reden)
+        self._wacht_op_forecast = abort.wacht_forecast
+        if abort.afgekoppeld:
+            self._set_execution_boolean(False)
+            self._set_desired_state("Pure solar", False, 0.0)
+            self._reset_laadtracking()
+            self._clear_plan()
+            self._set_plan_status("opnieuw_berekenen", "Auto losgekoppeld; maak na opnieuw aansluiten een nieuw plan.")
+        else:
+            self._clear_plan()
+            self._set_desired_state("Pure solar", False, 0.0)
+            self._reset_laadtracking()
+        self._save_persistent_data()
+
+    def _bereken_laadplan_uitvoeren(self, concept: bool):
+        if not self._check_kritieke_sensoren(melden=concept):
+            raise PlanningAbort("Kritieke sensor onbeschikbaar.")
+        self._clear_plan()
+        tijd_str = self.get_state(self.vertrektijd_entity)
+        if tijd_str is None:
+            raise PlanningAbort("Vertrektijd is None! Stoppen.")
+        vertrektijd = self._parse_vertrektijd(tijd_str)
+
+        nu = datetime.datetime.now(tz.UTC)
+        if vertrektijd <= nu:
+            raise PlanningAbort("Vertrektijd in verleden. Standby.", fout=False)
+        if not self._is_auto_verbonden():
+            raise PlanningAbort("Geen auto verbonden. Standby.", fout=False, afgekoppeld=True)
+
+        # Doel-SoC en behoefte (FordPass is leidend; bij verouderde SoC schatten via de Peblar-meter)
+        gewenste_km = self.get_sensor_float(self.gewenste_km_entity)
+        huidig_bereik = self.get_sensor_float(self.bereik_entity)
+        huidige_soc = self.get_sensor_float(self.soc_entity)
+        if None in [gewenste_km, huidig_bereik, huidige_soc]:
+            raise PlanningAbort("Kritieke sensoren ontbreken!")
+        huidige_energie = self.get_sensor_float(self.peblar_energie_entity)
+        if huidige_energie is None:
+            raise PlanningAbort("Energie sensor ongeldig!")
+
+        effectieve_soc = self._effectieve_soc(huidige_soc, huidige_energie)
+        km_per_procent = (huidig_bereik / huidige_soc if huidige_soc > 0 and huidig_bereik > 0 else self.FALLBACK_KM_PER_PERCENT)
+        doel_soc = max(self.MIN_SOC_SAFETY, min(100.0, (gewenste_km / km_per_procent) + self.VEILIGHEIDSMARGE_PERCENT))
+        netto_behoefte_kwh = max(0.0, ((doel_soc - effectieve_soc) / 100.0) * self.ACCU_CAP_KWH)
+        laad_behoefte_kwh = netto_behoefte_kwh / self.LAADRENDEMENT
+        self.log(f"SoC: {effectieve_soc:.1f}% -> {doel_soc:.1f}% (+{self.VEILIGHEIDSMARGE_PERCENT}% marge). "
+                 f"Netladen behoefte: {netto_behoefte_kwh:.2f} kWh ({laad_behoefte_kwh:.2f} kWh uit het net)")
+
+        forecast = self._lees_forecast()
+        if forecast is None:
+            raise PlanningAbort("Forecast niet beschikbaar of verouderd.", fout=False, wacht_forecast=True)
+        self._wacht_op_forecast = False
+
+        self.matrix_kwartieren, ontbrekend = self._bouw_matrix(forecast, nu, vertrektijd)
+
+        if ontbrekend > 0:
+            self._log_bij_verandering("forecast_ontbreekt",
+                                      f"{ontbrekend} kwartier(en) niet in forecast, fallbackwaarden gebruikt.")
+        else:
+            self._log_bij_verandering("forecast_ontbreekt", None)
+
+        fallback_kwartieren = [u for u in self.matrix_kwartieren if u["prijs_bron"] == "fallback"]
+        if fallback_kwartieren:
+            eerste_fallback = fallback_kwartieren[0]["tijd"].astimezone(self._local_tz).strftime("%d-%m %H:%M")
+            self._log_bij_verandering(
+                "fallback_prijzen",
+                f"{len(fallback_kwartieren)} van {len(self.matrix_kwartieren)} kwartieren tot vertrektijd gebruiken "
+                f"een fallbackprijs (eerste: {eerste_fallback}). De planning is daar minder betrouwbaar.")
+        else:
+            self._log_bij_verandering("fallback_prijzen", None)
+
+        # Plan zonladen en netladen
+        if laad_behoefte_kwh > self.TOLERANCE:
+            totale_capaciteit = sum(u["laadbare_zon_kwh"] + u["max_net_kwh"] for u in self.matrix_kwartieren)
+            if totale_capaciteit < laad_behoefte_kwh - self.TOLERANCE:
+                raise PlanningAbort(f"Onvoldoende capaciteit: {totale_capaciteit:.2f} kWh beschikbaar.")
+            if not self._bereken_geintegreerd_plan(laad_behoefte_kwh):
+                self._plan_zo_veel_mogelijk(laad_behoefte_kwh)
+        else:
+            self._bereken_zonladen_plan()
+
+        if self.plan:
+            start = min(self.plan.keys()).strftime("%Y-%m-%d %H:%M")
+            end = max(self.plan.keys()).strftime("%Y-%m-%d %H:%M")
+            zon_total = sum(v['zon_kwh'] for v in self.plan.values())
+            net_total = sum(v['net_kwh'] for v in self.plan.values())
+            self.log(f"Plan: {start}–{end} | Zon: {zon_total:.2f} kWh | Net: {net_total:.2f} kWh")
+        else:
+            self.log("Geen netladen nodig, alleen zonladen.")
+
+        # Plan is gelukt: pas nu de sessiebaseline aan (SoC-gebaseerde behoefte vanaf nu)
+        self._cancel_progress_update_timer()
+        self.initiele_energie = max(0.0, huidige_energie)
+        self.cumulatief_geladen_kwh = 0.0
+        self._last_progress_kwh = 0.0
+        self.sessie_actief = True
+        self.sessie_doel_kwh = laad_behoefte_kwh
+        self.doel_soc = doel_soc
+        self._registreer_soc(huidige_soc, huidige_energie)
+        self.log(f"Sessiebaseline bijgewerkt: initiele energie = {self.initiele_energie:.2f} kWh, SoC = {huidige_soc}%")
+
+        self.last_plan_calculation = nu
+        if concept:
+            self._set_plan_status("concept", "Wacht op goedkeuring via de uitvoerschakelaar.")
+        else:
+            self._plan_start_time = nu
+            self._plan_start_meterstand = huidige_energie
+            self._set_plan_status("in_uitvoering")
+        self._save_persistent_data()
+        self._update_graph_data()
 
     def _bereken_zonladen_plan(self):
         with self._lock:
@@ -1070,7 +1168,7 @@ class PeblarHorizonPlanner(hass.Hass):
                     idx += 1
 
                 if (gevuld_kwh >= laad_behoefte_kwh - self.TOLERANCE and
-                    window_cost < min_window_cost):
+                    window_cost < min_window_cost - 1e-9):
                     min_window_cost = window_cost
                     best_start_idx = start_idx
                     best_end_idx = start_idx + idx
@@ -1135,28 +1233,36 @@ class PeblarHorizonPlanner(hass.Hass):
                 huidige_soc = self.get_sensor_float(self.soc_entity)
                 huidige_energie = self.get_sensor_float(self.peblar_energie_entity)
 
+                # Peblar-sensoren: korte storingen tolereren, langdurige storing stopt de sessie
                 if huidige_energie is None or not self._check_kritieke_sensoren(
                     include_vehicle_sensors=False,
                     include_status_sensor=False,
+                    melden=False,
                 ):
-                    self.error("Kritieke sensoren ontbreken of onbeschikbaar!")
-                    self._send_push_notification("Sensorstoring", "Kritieke sensor(en) onbeschikbaar. Sessie gestopt.")
+                    self._sensor_storingen += 1
+                    if self._sensor_storingen < self.MAX_SENSOR_STORING_KWARTIEREN:
+                        self._log_bij_verandering(
+                            "peblar_sensoren",
+                            "Peblar-sensor(en) tijdelijk onbeschikbaar; laadpaal blijft in de huidige stand "
+                            "en de schakeling wacht op herstel.")
+                        if self._sensor_storingen == 1:
+                            self._send_push_notification(
+                                "Sensorstoring", "Peblar-sensor(en) onbeschikbaar; schakeling wacht op herstel.")
+                        return
+                    self.error("Peblar-sensoren langdurig onbeschikbaar!")
+                    self._send_push_notification("Sensorstoring", "Peblar-sensor(en) langdurig onbeschikbaar. Sessie gestopt.")
                     self._set_execution_boolean(False)
                     self._set_desired_state("Pure solar", False, 0.0)
                     self._reset_laadtracking()
-                    self._set_plan_status("fout", "Kritieke sensor ontbreekt; uitvoering gestopt.")
+                    self._set_plan_status("fout", "Peblar-sensor ontbreekt; uitvoering gestopt.")
                     self._save_persistent_data()
                     return
+                self._sensor_storingen = 0
+                self._log_bij_verandering("peblar_sensoren", None)
 
-                auto_status = str(self.get_state(self.peblar_status_entity) or "").lower()
-                connected_statuses = {
-                    "preparing",
-                    "charging",
-                    "suspendedev",
-                    "suspendedevse",
-                    "finishing",
-                }
-                if auto_status == "available":
+                auto_status = self.get_state(self.peblar_status_entity)
+                status_klasse = self._status_klasse(auto_status)
+                if status_klasse == "losgekoppeld":
                     self.log("Auto losgekoppeld. Harde stop.")
                     self._set_execution_boolean(False)
                     self._set_desired_state("Pure solar", False, 0.0)
@@ -1168,10 +1274,10 @@ class PeblarHorizonPlanner(hass.Hass):
                     )
                     self._save_persistent_data()
                     return
-                if auto_status not in connected_statuses:
+                if status_klasse != "verbonden":
                     self._log_bij_verandering(
                         "peblar_status",
-                        f"Peblar-status tijdelijk niet bruikbaar ('{auto_status or 'None'}'); "
+                        f"Peblar-status '{auto_status}' is niet bruikbaar voor schakeling; "
                         "sessie blijft behouden en schakeling wacht op herstel.",
                     )
                     return
@@ -1186,7 +1292,7 @@ class PeblarHorizonPlanner(hass.Hass):
                 huidig_kwartier = nu.replace(second=0, microsecond=0, minute=(nu.minute // 15) * 15, tzinfo=tz.UTC)
 
                 afwijking_kwh = self._plan_afwijking_kwh(huidige_energie, nu)
-                plan_ontbreekt = not self.matrix_kwartieren or self.plan_valid_until is None
+                plan_ontbreekt = not self.matrix_kwartieren
                 grote_afwijking = (afwijking_kwh is not None and
                                    abs(afwijking_kwh) >= self.PLAN_CORRECTIE_TOLERANTIE_KWH)
                 if plan_ontbreekt:
@@ -1196,18 +1302,14 @@ class PeblarHorizonPlanner(hass.Hass):
                     return
                 if grote_afwijking:
                     self.log(f"Laadenergie wijkt {afwijking_kwh:+.2f} kWh af van plan; planning corrigeren.")
-                    if huidige_soc is not None:
-                        self.bereken_laadplan(concept=False)
-                        if self.last_plan_calculation is None:
-                            self._set_execution_boolean(False)
-                            self._set_desired_state("Pure solar", False, 0.0)
-                            self._set_plan_status("fout", "Automatische plancorrectie mislukt.")
-                            return
+                    if huidige_soc is None:
+                        self._log_bij_verandering(
+                            "plancorrectie",
+                            "Plancorrectie uitgesteld: FordPass-SoC niet betrouwbaar beschikbaar; "
+                            "bestaand plan blijft actief.")
+                    elif self.bereken_laadplan(concept=False):
                         huidig_kwartier = nu.replace(second=0, microsecond=0, minute=(nu.minute // 15) * 15, tzinfo=tz.UTC)
-                    else:
-                        self.log("Plancorrectie uitgesteld omdat FordPass-SoC niet betrouwbaar beschikbaar is.")
-                elif nu >= self.plan_valid_until:
-                    self.plan_valid_until = nu + datetime.timedelta(minutes=self.PLAN_VALIDITY_MINUTES)
+                    # Mislukt de correctie, dan herstelt bereken_laadplan de vorige staat en loopt het plan door.
 
                 # Tracking
                 if self.initiele_energie is not None:
@@ -1249,9 +1351,11 @@ class PeblarHorizonPlanner(hass.Hass):
                 elif not current_power_on:
                     self.last_power_on_time = None
 
-                # NOOD: SoC te laag
-                if huidige_soc is not None and huidige_soc < self.MIN_SOC_SAFETY:
-                    self.log(f"NOOD: SoC {huidige_soc}% < {self.MIN_SOC_SAFETY}%. Maximaal laden.")
+                # NOOD: SoC te laag (verouderde FordPass-waarde wordt via de meter bijgeschat)
+                soc_voor_nood = (self._effectieve_soc(huidige_soc, huidige_energie)
+                                 if huidige_soc is not None else None)
+                if soc_voor_nood is not None and soc_voor_nood < self.MIN_SOC_SAFETY:
+                    self.log(f"NOOD: SoC {soc_voor_nood:.1f}% < {self.MIN_SOC_SAFETY}%. Maximaal laden.")
                     self._set_desired_state("Default", True, self.MAX_PAAL_KW)
                 # Netladen
                 elif net_kwh > self.TOLERANCE:
@@ -1316,6 +1420,7 @@ class PeblarHorizonPlanner(hass.Hass):
                     "laadplanning_net": [],
                     "prijs_bron": [],
                 }
+                self._markeer_graph_paginas_stale(generated_at)
                 self.set_state(self.GRAPH_DATA_ENTITY, state=generated_at, attributes=attributes)
                 return
 
@@ -1468,7 +1573,29 @@ class PeblarHorizonPlanner(hass.Hass):
                 attributes=attributes_for(data, page_number, start, len(pages)),
             )
             entity_ids.append(entity_id)
+        self._markeer_graph_paginas_stale(generated_at, topic=topic, vanaf=len(entity_ids) + 1)
+        self._graph_page_counts[topic] = len(entity_ids)
         return entity_ids
+
+    def _markeer_graph_paginas_stale(self, generated_at: str, topic: Optional[str] = None, vanaf: int = 1):
+        """Pagina-entiteiten uit een eerdere berekening kunnen niet worden verwijderd; markeer ze als leeg."""
+        topics = [topic] if topic is not None else list(self._graph_page_counts.keys())
+        for naam in topics:
+            for nummer in range(vanaf, self._graph_page_counts.get(naam, 0) + 1):
+                self.set_state(
+                    f"{self.GRAPH_DATA_ENTITY}_{naam}_{nummer}",
+                    state="leeg",
+                    attributes={
+                        "friendly_name": f"Peblar Horizon Planner {naam}",
+                        "generated_at": generated_at,
+                        "topic": naam,
+                        "page": nummer,
+                        "slot_count": 0,
+                        "stale": True,
+                    },
+                )
+            if topic is None:
+                self._graph_page_counts[naam] = 0
 
     def _set_desired_state(self, modus: str, power_on: bool, vermogen_kw: float):
         with self._lock:
@@ -1576,6 +1703,7 @@ class PeblarHorizonPlanner(hass.Hass):
         current_switch = self.get_state(self.peblar_switch_entity)
         if current_switch != "off":
             self._last_switch_command_state = "off"
+            self._last_switch_command_time = datetime.datetime.now(tz.UTC)
             self.call_service("switch/turn_off", entity_id=self.peblar_switch_entity)
             self.last_switch_call = datetime.datetime.now(tz.UTC)
             self.last_power_off_time = self.last_switch_call
@@ -1586,6 +1714,7 @@ class PeblarHorizonPlanner(hass.Hass):
         current_switch = self.get_state(self.peblar_switch_entity)
         if current_switch != "on":
             self._last_switch_command_state = "on"
+            self._last_switch_command_time = datetime.datetime.now(tz.UTC)
             self.call_service("switch/turn_on", entity_id=self.peblar_switch_entity)
             self.last_switch_call = datetime.datetime.now(tz.UTC)
             self.last_power_on_time = self.last_switch_call
