@@ -592,7 +592,7 @@ class EnergieCorePredictor(hass.Hass):
         nordpool_ongeldig = 0
         nordpool = self.get_state(self.nordpool_prijs_entity, attribute="all")
         nordpool_attrs = (nordpool.get("attributes", {}) or {}) if nordpool else {}
-        for key in ("raw_today", "raw_tomorrow"):
+        for key in ("prices_today", "prices_tomorrow"):
             waarden = nordpool_attrs.get(key)
             if not isinstance(waarden, list):
                 continue
