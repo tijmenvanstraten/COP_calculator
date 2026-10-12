@@ -78,16 +78,22 @@ class EnergieCorePredictor(hass.Hass):
     }
     # Cumulatieve kWh-tellers (state_class total_increasing). PAS DEZE AAN in apps.yaml.
     DEFAULT_PLUS_ENTITIES = [
-        "sensor.p1_energie_import_tarief_1",
-        "sensor.p1_energie_import_tarief_2",
-        "sensor.zonnepanelen_energie_totaal",
+        "sensor.p1_meter_energy_import_tariff_1",
+        "sensor.p1_meter_energy_import_tariff_2",
+        "sensor.solaredge_i1_ac_energy",
     ]
     DEFAULT_MIN_ENTITIES = [
-        "sensor.p1_energie_export_tarief_1",
-        "sensor.p1_energie_export_tarief_2",
+        "sensor.p1_meter_energy_export_tariff_1",
+        "sensor.p1_meter_energy_export_tariff_2",
         "sensor.peblar_ev_charger_levenslange_energie",
     ]
-    DEFAULT_SOLCAST_EXTRA_ENTITIES: List[str] = []
+    DEFAULT_SOLCAST_EXTRA_ENTITIES: List[str] = [
+        "sensor.solcast_pv_forecast_forecast_day_3",
+        "sensor.solcast_pv_forecast_forecast_day_4",
+        "sensor.solcast_pv_forecast_forecast_day_5",
+        "sensor.solcast_pv_forecast_forecast_day_6",
+        "sensor.solcast_pv_forecast_forecast_day_7",
+    ]
 
     def initialize(self):
         self.log("Energie Core Predictor v3 opgestart.")
@@ -171,9 +177,9 @@ class EnergieCorePredictor(hass.Hass):
                    + [self.nordpool_prijs_entity, self.epex_prijs_entity]):
             try:
                 if self.get_state(entity) is None:
-                    self.warning(f"Entiteit {entity} bestaat niet (controleer apps.yaml).")
+                    self.log(f"Entiteit {entity} bestaat niet (controleer apps.yaml).", level="WARNING")
             except Exception as e:
-                self.warning(f"Kon entiteit {entity} niet controleren: {self._sanitize_error(e)}")
+                self.log(f"Kon entiteit {entity} niet controleren: {self._sanitize_error(e)}", level="WARNING")
 
     def _schedule_kwartier_timer(self):
         nu = datetime.datetime.now(tz.UTC)
@@ -507,7 +513,7 @@ class EnergieCorePredictor(hass.Hass):
             self.log(f"{uitgesloten} onrealistische verbruikskwartieren uitgesloten van de historie.")
 
         if not profiel_recent and not profiel_vorig:
-            self.warning("Verbruikshistorie uit statistics bevat geen bruikbare kwartieren, gebruik fallback.")
+            self.log("Verbruikshistorie uit statistics bevat geen bruikbare kwartieren, gebruik fallback.", level="WARNING")
             with self._lock:
                 self._history_next_try = retry
                 waarschuwingen.append("Geen nieuwe bruikbare historie geladen; laatst bekende profielen blijven actief waar beschikbaar.")
@@ -555,7 +561,8 @@ class EnergieCorePredictor(hass.Hass):
             if not toestand:
                 continue
             gevonden = True
-            fc.extend((toestand.get("attributes", {}) or {}).get("forecasts", []) or [])
+            attrs = (toestand.get("attributes", {}) or {})
+            fc.extend(attrs.get("detailedForecast", []) or [])
         if not gevonden:
             waarschuwingen.append("Geen Solcast forecasts beschikbaar, PV = 0.")
             return
@@ -564,8 +571,8 @@ class EnergieCorePredictor(hass.Hass):
         ongeldig = 0
         for f in fc:
             try:
-                period_end = self._parse_iso_to_utc(f["period_end"])
-                period_start = period_end - datetime.timedelta(minutes=30)
+                period_start = self._parse_iso_to_utc(f["period_start"])
+                period_end = period_start + datetime.timedelta(minutes=30)
                 pv_kwh = max(0.0, float(f.get("pv_estimate", 0.0) or 0.0)) / deler
                 if not math.isfinite(pv_kwh):
                     raise ValueError("niet-eindige pv_estimate")
@@ -592,7 +599,7 @@ class EnergieCorePredictor(hass.Hass):
         nordpool_ongeldig = 0
         nordpool = self.get_state(self.nordpool_prijs_entity, attribute="all")
         nordpool_attrs = (nordpool.get("attributes", {}) or {}) if nordpool else {}
-        for key in ("raw_today", "raw_tomorrow"):
+        for key in ("prices_today", "prices_tomorrow"):
             waarden = nordpool_attrs.get(key)
             if not isinstance(waarden, list):
                 continue
@@ -680,7 +687,7 @@ class EnergieCorePredictor(hass.Hass):
     def _log_waarschuwingen_bij_verandering(self, waarschuwingen: List[str]):
         huidig = set(waarschuwingen)
         for w in sorted(huidig - self._gelogde_waarschuwingen):
-            self.warning(f"Forecast waarschuwing: {w}")
+            self.log(f"Forecast waarschuwing: {w}", level="WARNING")
         for w in sorted(self._gelogde_waarschuwingen - huidig):
             self.log(f"Forecast waarschuwing opgelost: {w}")
         self._gelogde_waarschuwingen = huidig
