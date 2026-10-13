@@ -27,6 +27,10 @@ ingebouwde (hele graden, ``builtin_*``). ``temperature_source`` kiest: ``own``, 
 inlaat komen altijd uit dezelfde set. Optioneel kan een ``input_select`` live wisselen
 (``temperature_source_entity``). Elke set heeft een eigen offset.
 
+Warm tapwater: in DHW-modus loopt het water door de driewegklep naar de tankspiraal. Sensoren
+buiten de unit (op de verwarmingsleidingen) zien dat circuit niet of slechts deels, daarom
+gebruikt DHW standaard de ingebouwde sensoren (``dhw_temperature_source: builtin``).
+
 Controle van de ΔT-sensoren (delta_t_audit)
 -------------------------------------------
 Tijdens bedrijf wordt de ΔT van beide sets vergeleken. Eén meting van de ingebouwde sensoren is
@@ -173,6 +177,10 @@ class COPCalculator(hass.Hass):
         if self.temperature_source not in ("own", "builtin", "auto"):
             self.warning(f"Onbekende temperature_source '{self.temperature_source}', 'auto' gebruikt.")
             self.temperature_source = "auto"
+        self.dhw_temperature_source = str(self.args.get("dhw_temperature_source", "builtin")).strip().lower()
+        if self.dhw_temperature_source not in ("own", "builtin", "auto"):
+            self.warning(f"Onbekende dhw_temperature_source '{self.dhw_temperature_source}', 'builtin' gebruikt.")
+            self.dhw_temperature_source = "builtin"
         self.own_max_deviation = max(0.0, self._arg("own_max_deviation", 5.0, float))
         self.source_switch_seconds = max(0.0, self._arg("source_switch_seconds", 120, float))
         self.flow_correction_factor = self._arg("flow_correction_factor", 1.0, float)
@@ -983,11 +991,22 @@ class COPCalculator(hass.Hass):
         if source != self._source_in_use and self._source_in_use is not None and source is not None:
             self._warn_throttled(f"switch-{source}", f"Temperatuurbron gewijzigd: {self._source_in_use} -> {source}.")
         self._source_in_use = source
+
+        # Aparte keuze voor het DHW-circuit (zie docstring): standaard alleen ingebouwde sensoren.
+        if self.dhw_temperature_source == "own":
+            dhw_source, dhw_pair = ("own", own) if own else (None, None)
+        elif self.dhw_temperature_source == "builtin":
+            dhw_source, dhw_pair = ("builtin", builtin) if builtin else (None, None)
+        else:
+            dhw_source, dhw_pair = source, pair
         self._temp_info = {"setting": setting, "deviating": deviating}
         return {
             "source": source,
             "outlet": pair[0] if pair else None,
             "inlet": pair[1] if pair else None,
+            "dhw_source": dhw_source,
+            "dhw_outlet": dhw_pair[0] if dhw_pair else None,
+            "dhw_inlet": dhw_pair[1] if dhw_pair else None,
             "own": own,
             "builtin": builtin,
         }
@@ -1119,9 +1138,13 @@ class COPCalculator(hass.Hass):
             flow = None
         dhw_temp = self._get_float("dhw_current_temp_entity")
 
-        loop_thermal = self._loop_thermal_power(mode, outlet_temp, inlet_temp, flow, source) if mode else None
-        if mode and source and loop_thermal is not None:
-            self.data["meta"]["temp_source_seconds"][source] += elapsed
+        if mode == "dhw":
+            loop_outlet, loop_inlet, loop_source = temps["dhw_outlet"], temps["dhw_inlet"], temps["dhw_source"]
+        else:
+            loop_outlet, loop_inlet, loop_source = outlet_temp, inlet_temp, source
+        loop_thermal = self._loop_thermal_power(mode, loop_outlet, loop_inlet, flow, loop_source) if mode else None
+        if mode and loop_source and loop_thermal is not None:
+            self.data["meta"]["temp_source_seconds"][loop_source] += elapsed
 
         # Categorie waaronder het elektrische verbruik van deze tick valt.
         if mode in self.SPACE_MODES:
@@ -1152,7 +1175,7 @@ class COPCalculator(hass.Hass):
         self._maybe_finish_dhw(now)
 
         self._track_delta_t_calibration(elapsed, outdoor_power, dhw_heater, flow, temps["own"])
-        if mode:
+        if mode in self.SPACE_MODES:
             self._track_audit(mode, elapsed, temps["own"], temps["builtin"], flow)
         active = mode is not None or dhw_heater
         self._status = "stale_sources" if (self._stale_sources and active) else "ok"
