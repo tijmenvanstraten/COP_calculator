@@ -9,6 +9,8 @@ class EMSVerwarming(hass.Hass):
     MODBUS_HASS_TIMEOUT = 5
     MODBUS_TIMEOUT = 10
     MODBUS_RETRIES = 3
+    STATUS_VERIFY_INTERVAL_SECONDS = 10
+    STATUS_VERIFY_MAX_ATTEMPTS = 3
     FALLBACK_K_AFKOEL = 0.015
     FALLBACK_K_SOLAR = 0.48
     FALLBACK_K_OPWARM = 1.15
@@ -20,10 +22,12 @@ class EMSVerwarming(hass.Hass):
     PRICE_HYSTERESIS_EUR = 0.005
     PV_BUFFER_POWER_W = 1500
     BUFFER_TEMPERATURE_MARGIN_C = 0.5
-    SIMULATION_STEP_HOURS = 0.25
     SIMULATION_QUARTER_MINUTES = 15
     SIMULATION_HORIZON_QUARTERS = 16
     FORECAST_VALUE_KEYS = ("pv_kw", "net_prijs")
+    WP_STATUS_AAN = "operation_state_heat_thermo_on"
+    FORECAST_ENTITY = "sensor.energie_core_forecast"
+    VRIJGAVE_HELPER = "input_boolean.verwarming_vrijgave"
 
     def initialize(self):
         self.log("--- EMS Verwarming Gestart (Volledige Regie + Modbus + Beveiligingen) ---")
@@ -33,9 +37,9 @@ class EMSVerwarming(hass.Hass):
 
         # Sensor voor de werkelijke status van de warmtepomp
         self.wp_status_sensor = "sensor.control_unit_operation_state_2"
-        self.wp_status_aan_waarde = "operation_state_heat_thermo_on"
-        self.forecast_entity = "sensor.energie_core_forecast"
-        self.vrijgave_helper = "input_boolean.verwarming_vrijgave"
+        self.wp_status_aan_waarde = self.WP_STATUS_AAN
+        self.forecast_entity = self.FORECAST_ENTITY
+        self.vrijgave_helper = self.VRIJGAVE_HELPER
 
         self.listen_state(self._wp_status_changed, self.wp_status_sensor)
 
@@ -109,11 +113,28 @@ class EMSVerwarming(hass.Hass):
     ):
         # k_wind is per km/h; met windsnelheid wordt dit een afkoelfactor per uur.
         loss_rate = k_afkoel + k_wind * wind_speed
+        step_hours = self.SIMULATION_QUARTER_MINUTES / 60
         return (
             indoor_temp
-            - ((indoor_temp - outdoor_temp) * loss_rate * self.SIMULATION_STEP_HOURS)
-            + (pv_kw * k_solar * self.SIMULATION_STEP_HOURS)
+            - ((indoor_temp - outdoor_temp) * loss_rate * step_hours)
+            + (pv_kw * k_solar * step_hours)
         )
+
+    def _forecast_price(self, forecast, target_dt, average_price):
+        price = self.get_forecast_value(
+            forecast, target_dt, "net_prijs", self.SIMULATION_QUARTER_MINUTES
+        )
+        if price is not None:
+            return price
+
+        preceding_prices = [
+            (item["tijd"], item["net_prijs"])
+            for item in forecast
+            if item["tijd"] <= target_dt
+        ]
+        if preceding_prices:
+            return max(preceding_prices, key=lambda item: item[0])[1]
+        return average_price
 
     def _wp_status_changed(self, entity, _attribute, _old, new, _kwargs):
         if new in (None, "unknown", "unavailable"):
@@ -265,6 +286,9 @@ class EMSVerwarming(hass.Hass):
             )
             self.stuur_warmtepomp(t_binnen < t_target_min, stooklijn_setpoint)
             return
+        gemiddelde_forecast_prijs = sum(
+            row["net_prijs"] for row in forecast
+        ) / len(forecast)
 
         # 3. Bereken benodigde stooktijd
         graden_te_overbruggen = max(0.1, target_temp - t_binnen)
@@ -305,10 +329,10 @@ class EMSVerwarming(hass.Hass):
                 tijd_s = nu + datetime.timedelta(
                     minutes=s * self.SIMULATION_QUARTER_MINUTES
                 )
-                prijs_s = self.get_forecast_value(
-                    forecast, tijd_s, "net_prijs", self.SIMULATION_QUARTER_MINUTES
+                prijs_s = self._forecast_price(
+                    forecast, tijd_s, gemiddelde_forecast_prijs
                 )
-                totaal_prijs_sessie += huidige_prijs if prijs_s is None else prijs_s
+                totaal_prijs_sessie += prijs_s
                 geldige_kwartieren += 1
 
             gem_prijs_sessie = totaal_prijs_sessie / geldige_kwartieren
@@ -326,10 +350,10 @@ class EMSVerwarming(hass.Hass):
                 tijd_s = nu + datetime.timedelta(
                     minutes=s * self.SIMULATION_QUARTER_MINUTES
                 )
-                prijs_s = self.get_forecast_value(
-                    forecast, tijd_s, "net_prijs", self.SIMULATION_QUARTER_MINUTES
+                prijs_s = self._forecast_price(
+                    forecast, tijd_s, gemiddelde_forecast_prijs
                 )
-                totaal_prijs_nu += huidige_prijs if prijs_s is None else prijs_s
+                totaal_prijs_nu += prijs_s
             gem_prijs_nu = totaal_prijs_nu / kwartieren_stooktijd
 
             verwarming_staat_aan = (
@@ -362,7 +386,7 @@ class EMSVerwarming(hass.Hass):
                 self.log(f"IDLE: Geen noodzaak en geen gunstige buffercondities. T_binnen: {round(t_binnen,2)}°C.", level="DEBUG")
                 self.stuur_warmtepomp(False, 20)
 
-    def stuur_warmtepomp(self, state_wensen, setpoint_wensen):
+    def stuur_warmtepomp(self, state_wensen, setpoint_wensen) -> bool:
         nu = self.datetime(aware=True)
         current_state_raw = self.get_state(self.wp_status_sensor)
         if current_state_raw in (None, "unknown", "unavailable"):
@@ -371,7 +395,7 @@ class EMSVerwarming(hass.Hass):
                 "Modbus-aansturing overgeslagen.",
                 level="ERROR",
             )
-            return
+            return False
         wp_actueel_aan = current_state_raw == self.wp_status_aan_waarde
         helper_is_on, seconds_in_state = self._last_switch_seconds(nu, wp_actueel_aan)
         new_state_bool = bool(state_wensen)
@@ -414,9 +438,9 @@ class EMSVerwarming(hass.Hass):
                 if vorig_setpoint != 20:
                     self.log("MODBUS: Schrijf Register 1005 = 20°C")
                     self._write_modbus_register(1005, 20)
-        except Exception:
-            self.error("Modbus-aansturing van de warmtepomp is mislukt.")
-            raise
+        except Exception as err:
+            self.error(f"Modbus-aansturing van de warmtepomp is mislukt: {err}")
+            return False
 
         if self.get_state(self.vrijgave_helper) != helper_state:
             self._save_switch_tracking(new_state_bool, nu, setpoint)
@@ -426,7 +450,13 @@ class EMSVerwarming(hass.Hass):
                 attributes={"geregistreerd_setpoint": setpoint},
             )
 
-        self.run_in(self._verify_warmtepomp_status, 15, expected_on=new_state_bool)
+        self.run_in(
+            self._verify_warmtepomp_status,
+            self.STATUS_VERIFY_INTERVAL_SECONDS,
+            expected_on=new_state_bool,
+            attempt=1,
+        )
+        return True
 
     def _write_modbus_register(self, address, value):
         for attempt in range(1, self.MODBUS_RETRIES + 1):
@@ -453,22 +483,42 @@ class EMSVerwarming(hass.Hass):
 
     def _verify_warmtepomp_status(self, kwargs):
         expected_on = kwargs["expected_on"]
+        attempt = kwargs["attempt"]
         current_status = self.get_state(self.wp_status_sensor)
         if current_status in (None, "unknown", "unavailable"):
             self.log(
-                f"Modbus-statuscontrole niet mogelijk: {self.wp_status_sensor} "
-                f"is {current_status!r}.",
+                f"Modbus-statuscontrole {attempt}/{self.STATUS_VERIFY_MAX_ATTEMPTS} "
+                f"nog niet mogelijk: {self.wp_status_sensor} is {current_status!r}.",
                 level="WARNING",
+            )
+            actual_on = None
+        else:
+            actual_on = current_status == self.wp_status_aan_waarde
+
+        if actual_on == expected_on:
+            return
+        if attempt < self.STATUS_VERIFY_MAX_ATTEMPTS:
+            self.log(
+                f"Modbus-statuscontrole {attempt}/{self.STATUS_VERIFY_MAX_ATTEMPTS}: "
+                f"verwacht {'AAN' if expected_on else 'UIT'}, "
+                f"gemeten {current_status!r}; controle wordt herhaald.",
+                level="WARNING",
+            )
+            self.run_in(
+                self._verify_warmtepomp_status,
+                self.STATUS_VERIFY_INTERVAL_SECONDS,
+                expected_on=expected_on,
+                attempt=attempt + 1,
             )
             return
-        actual_on = current_status == self.wp_status_aan_waarde
-        if actual_on != expected_on:
-            self.log(
-                "Modbus-statuscontrole mislukt: "
-                f"verwacht {'AAN' if expected_on else 'UIT'}, "
-                f"gemeten {'AAN' if actual_on else 'UIT'}.",
-                level="WARNING",
-            )
+
+        self.log(
+            "Modbus-statuscontrole is na "
+            f"{self.STATUS_VERIFY_MAX_ATTEMPTS * self.STATUS_VERIFY_INTERVAL_SECONDS}s "
+            f"nog niet geslaagd: verwacht {'AAN' if expected_on else 'UIT'}, "
+            f"gemeten {current_status!r}.",
+            level="ERROR",
+        )
 
     def get_forecast_value(self, data_list, target_dt, key, window_minutes):
         for item in data_list:
