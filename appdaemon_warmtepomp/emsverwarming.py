@@ -9,6 +9,21 @@ class EMSVerwarming(hass.Hass):
     MODBUS_HASS_TIMEOUT = 5
     MODBUS_TIMEOUT = 10
     MODBUS_RETRIES = 3
+    FALLBACK_K_AFKOEL = 0.015
+    FALLBACK_K_SOLAR = 0.48
+    FALLBACK_K_OPWARM = 1.15
+    FALLBACK_K_WIND = 0.0
+    WIND_SPEED_ENTITY = "sensor.thuis_windsnelheid"
+    WIND_LOSS_FACTOR_ENTITY = "sensor.huis_wind_loss_factor"
+    BUFFER_PRICE_THRESHOLD_EUR = 0.14
+    PRICE_WINDOW_TOLERANCE_EUR = 0.005
+    PRICE_HYSTERESIS_EUR = 0.005
+    PV_BUFFER_POWER_W = 1500
+    BUFFER_TEMPERATURE_MARGIN_C = 0.5
+    SIMULATION_STEP_HOURS = 0.25
+    SIMULATION_QUARTER_MINUTES = 15
+    SIMULATION_HORIZON_QUARTERS = 16
+    FORECAST_VALUE_KEYS = ("pv_kw", "net_prijs")
 
     def initialize(self):
         self.log("--- EMS Verwarming Gestart (Volledige Regie + Modbus + Beveiligingen) ---")
@@ -47,6 +62,58 @@ class EMSVerwarming(hass.Hass):
             )
             return default
         return result
+
+    def _validate_forecast(self, forecast):
+        if not isinstance(forecast, list):
+            self.log("Forecastmatrix heeft geen lijststructuur.", level="WARNING")
+            return []
+
+        valid_rows = []
+        invalid_rows = 0
+        for row in forecast:
+            if not isinstance(row, dict) or not row.get("tijd"):
+                invalid_rows += 1
+                continue
+            try:
+                time_value = row["tijd"]
+                period_start = (
+                    self.parse_datetime(time_value)
+                    if isinstance(time_value, str)
+                    else time_value
+                )
+                if not isinstance(period_start, datetime.datetime):
+                    raise ValueError("tijd is geen datetime")
+                if period_start.tzinfo is None:
+                    period_start = period_start.replace(tzinfo=datetime.timezone.utc)
+                values = {
+                    key: float(row[key])
+                    for key in self.FORECAST_VALUE_KEYS
+                }
+                if not all(math.isfinite(value) for value in values.values()):
+                    raise ValueError("forecast bevat een niet-eindige waarde")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                invalid_rows += 1
+                continue
+            valid_rows.append({"tijd": period_start, **values})
+
+        if invalid_rows:
+            self.log(
+                f"Forecastmatrix bevat {invalid_rows} ongeldige rij(en); "
+                f"{len(valid_rows)} bruikbare rij(en) behouden.",
+                level="WARNING",
+            )
+        return valid_rows
+
+    def _simulate_temperature_step(
+        self, indoor_temp, outdoor_temp, pv_kw, k_afkoel, k_solar, k_wind, wind_speed
+    ):
+        # k_wind is per km/h; met windsnelheid wordt dit een afkoelfactor per uur.
+        loss_rate = k_afkoel + k_wind * wind_speed
+        return (
+            indoor_temp
+            - ((indoor_temp - outdoor_temp) * loss_rate * self.SIMULATION_STEP_HOURS)
+            + (pv_kw * k_solar * self.SIMULATION_STEP_HOURS)
+        )
 
     def _wp_status_changed(self, entity, _attribute, _old, new, _kwargs):
         if new in (None, "unknown", "unavailable"):
@@ -105,16 +172,40 @@ class EMSVerwarming(hass.Hass):
 
     def simuleer_behoefte(self, _kwargs):
         # Thermische eigenschappen van het huis
-        k_afkoel = self._get_float_state("sensor.huis_afkoel_constante", 0.015)
-        k_solar = self._get_float_state("sensor.huis_solar_gain_constante", 0.48)
-        k_opwarm = self._get_float_state("sensor.huis_opwarm_constante", 1.15)
+        k_afkoel = self._get_float_state(
+            "sensor.huis_afkoel_constante", self.FALLBACK_K_AFKOEL
+        )
+        k_solar = self._get_float_state(
+            "sensor.huis_solar_gain_constante", self.FALLBACK_K_SOLAR
+        )
+        k_wind = self._get_float_state(
+            self.WIND_LOSS_FACTOR_ENTITY, self.FALLBACK_K_WIND
+        )
+        k_opwarm = self._get_float_state(
+            "sensor.huis_opwarm_constante", self.FALLBACK_K_OPWARM
+        )
+        wind_speed = self._get_float_state(self.WIND_SPEED_ENTITY, 0.0)
+        if k_wind < 0:
+            self.log(
+                f"Sensor {self.WIND_LOSS_FACTOR_ENTITY} mag niet negatief zijn; "
+                "windcorrectie uitgeschakeld.",
+                level="WARNING",
+            )
+            k_wind = 0.0
+        if wind_speed < 0:
+            self.log(
+                f"Sensor {self.WIND_SPEED_ENTITY} mag niet negatief zijn; "
+                "windcorrectie uitgeschakeld.",
+                level="WARNING",
+            )
+            wind_speed = 0.0
         if k_opwarm <= 0:
             self.log(
                 "Sensor sensor.huis_opwarm_constante moet groter zijn dan 0; "
-                "fallback 1.15 gebruikt.",
+                f"fallback {self.FALLBACK_K_OPWARM} gebruikt.",
                 level="WARNING",
             )
-            k_opwarm = 1.15
+            k_opwarm = self.FALLBACK_K_OPWARM
 
         # Actuele sensoren en stooklijn
         t_binnen = self._get_float_state("sensor.woonkamer_temperatuur_gemiddeld", 19.0)
@@ -148,10 +239,11 @@ class EMSVerwarming(hass.Hass):
 
         # Forecastmatrix levert zowel de PV-verwachting als het all-in tarief.
         forecast_state = self.get_state(self.forecast_entity)
-        forecast = self.get_state(self.forecast_entity, attribute="forecast")
+        forecast = self._validate_forecast(
+            self.get_state(self.forecast_entity, attribute="forecast")
+        )
         if (
             forecast_state in (None, "unknown", "unavailable")
-            or not isinstance(forecast, list)
             or not forecast
         ):
             self.log(
@@ -176,7 +268,9 @@ class EMSVerwarming(hass.Hass):
 
         # 3. Bereken benodigde stooktijd
         graden_te_overbruggen = max(0.1, target_temp - t_binnen)
-        kwartieren_stooktijd = int(math.ceil((graden_te_overbruggen / k_opwarm) * 4))
+        kwartieren_stooktijd = int(
+            math.ceil((graden_te_overbruggen / k_opwarm) * (60 / self.SIMULATION_QUARTER_MINUTES))
+        )
         kwartieren_stooktijd = max(1, kwartieren_stooktijd)
 
         # 4. De Thermische & Financiële Simulatie (4 uur vooruitkijken)
@@ -184,13 +278,22 @@ class EMSVerwarming(hass.Hass):
         stoken_nodig_vanaf_q = None
         laagste_gem_prijs = 999.0
         moment_start_stoken = 0
-        horizon_kwartieren = 16
+        horizon_kwartieren = self.SIMULATION_HORIZON_QUARTERS
 
         for q in range(0, horizon_kwartieren + 1):
-            doel_tijd = nu + datetime.timedelta(minutes=q * 15)
+            doel_tijd = nu + datetime.timedelta(
+                minutes=q * self.SIMULATION_QUARTER_MINUTES
+            )
 
-            zon_q = self.get_forecast_value(forecast, doel_tijd, "pv_kw", 15) or 0.0
-            sim_t = sim_t - ((sim_t - t_buiten) * k_afkoel * 0.25) + (zon_q * k_solar * 0.25)
+            zon_q = (
+                self.get_forecast_value(
+                    forecast, doel_tijd, "pv_kw", self.SIMULATION_QUARTER_MINUTES
+                )
+                or 0.0
+            )
+            sim_t = self._simulate_temperature_step(
+                sim_t, t_buiten, zon_q, k_afkoel, k_solar, k_wind, wind_speed
+            )
 
             if sim_t < t_target_min and stoken_nodig_vanaf_q is None:
                 stoken_nodig_vanaf_q = q
@@ -199,8 +302,12 @@ class EMSVerwarming(hass.Hass):
             geldige_kwartieren = 0
 
             for s in range(q, q + kwartieren_stooktijd):
-                tijd_s = nu + datetime.timedelta(minutes=s * 15)
-                prijs_s = self.get_forecast_value(forecast, tijd_s, "net_prijs", 15)
+                tijd_s = nu + datetime.timedelta(
+                    minutes=s * self.SIMULATION_QUARTER_MINUTES
+                )
+                prijs_s = self.get_forecast_value(
+                    forecast, tijd_s, "net_prijs", self.SIMULATION_QUARTER_MINUTES
+                )
                 totaal_prijs_sessie += huidige_prijs if prijs_s is None else prijs_s
                 geldige_kwartieren += 1
 
@@ -210,22 +317,28 @@ class EMSVerwarming(hass.Hass):
                 moment_start_stoken = q
 
         # 5. De Beslissing voor NU
-        zon_lockout = zon_nu > 500
         prijs_nu_all_in = huidige_prijs
 
         # STRATEGIE A: Er is een warmtebehoefte voorspeld binnen 4 uur
         if stoken_nodig_vanaf_q is not None:
             totaal_prijs_nu = 0
             for s in range(0, kwartieren_stooktijd):
-                tijd_s = nu + datetime.timedelta(minutes=s * 15)
-                prijs_s = self.get_forecast_value(forecast, tijd_s, "net_prijs", 15)
+                tijd_s = nu + datetime.timedelta(
+                    minutes=s * self.SIMULATION_QUARTER_MINUTES
+                )
+                prijs_s = self.get_forecast_value(
+                    forecast, tijd_s, "net_prijs", self.SIMULATION_QUARTER_MINUTES
+                )
                 totaal_prijs_nu += huidige_prijs if prijs_s is None else prijs_s
             gem_prijs_nu = totaal_prijs_nu / kwartieren_stooktijd
 
-            if zon_lockout:
-                self.log(f"UIT: Noodzaak over {stoken_nodig_vanaf_q*15}m, maar actuele zon blockt ({int(zon_nu)}W).")
-                self.stuur_warmtepomp(False, 20)
-            elif gem_prijs_nu <= laagste_gem_prijs + 0.005:
+            verwarming_staat_aan = (
+                self.get_state(self.vrijgave_helper) == "on"
+            )
+            prijsruimte = self.PRICE_WINDOW_TOLERANCE_EUR
+            if verwarming_staat_aan:
+                prijsruimte += self.PRICE_HYSTERESIS_EUR
+            if gem_prijs_nu <= laagste_gem_prijs + prijsruimte:
                 self.log(f"AAN: Noodzaak over {stoken_nodig_vanaf_q*15}m. Prijs nu ({round(gem_prijs_nu,3)}) is optimaal.")
                 self.stuur_warmtepomp(True, stooklijn_setpoint)
             else:
@@ -234,7 +347,14 @@ class EMSVerwarming(hass.Hass):
 
         # STRATEGIE B: OPPORTUNISTISCH VOORVERWARMEN (Bufferen)
         else:
-            if (prijs_nu_all_in < 0.14 or zon_nu > 1500) and t_binnen < (target_temp + 0.5):
+            verwarming_staat_aan = self.get_state(self.vrijgave_helper) == "on"
+            prijsgrens = self.BUFFER_PRICE_THRESHOLD_EUR
+            if verwarming_staat_aan:
+                prijsgrens += self.PRICE_HYSTERESIS_EUR
+            if (
+                (prijs_nu_all_in < prijsgrens or zon_nu > self.PV_BUFFER_POWER_W)
+                and t_binnen < (target_temp + self.BUFFER_TEMPERATURE_MARGIN_C)
+            ):
                 self.log(f"AAN (Bufferen): Prijs is laag ({round(prijs_nu_all_in,3)}) of zon schijnt. Vloer laden. T_binnen: {t_binnen}°C")
                 self.stuur_warmtepomp(True, stooklijn_setpoint)
             else:
