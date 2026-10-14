@@ -131,6 +131,7 @@ class COPCalculator(hass.Hass):
     AUDIT_MIN_SECONDS = 1800
     CAL_MAX_SAMPLES = 1500            # totaal
     CAL_MAX_PER_BIN = 120             # per inlaattemperatuur-bin; oudste vallen eruit, zodat alle temperaturen bewaard blijven
+    INTEGER_SENSOR_DEADBAND = 1.5     # K, minimale deadband voor een DHW-sensor in hele graden (voorkomt tellen van knipperen)
     CAL_BIN_WIDTH = 5.0               # K, breedte van de inlaattemperatuur-bins
     CAL_MIN_BIN_SAMPLES = 10
 
@@ -234,6 +235,13 @@ class COPCalculator(hass.Hass):
         self._last_saved_iso = None
 
         loaded_from = self._load_data()
+        if loaded_from is None:
+            self._apply_import_totals()
+        elif self.args.get("import_totals"):
+            self.log(
+                "import_totals genegeerd: er is al een databestand. Verwijder de map "
+                f"{self.data_dir} (en herstart) om opnieuw te importeren."
+            )
         self._init_calendar(now)
         self._check_storage_writable()
 
@@ -347,6 +355,7 @@ class COPCalculator(hass.Hass):
         ):
             run[key] = self._num(run.get(key))
         run.setdefault("start_time", None)
+        run["non_integer"] = bool(run.get("non_integer", False))
         return run
 
     def _normalize_data(self):
@@ -485,6 +494,34 @@ class COPCalculator(hass.Hass):
                 "er is met lege tellers gestart."
             )
         return None
+
+    def _apply_import_totals(self):
+        """Zaai de tellers eenmalig uit ``import_totals`` in apps.yaml (alleen bij een schone start).
+
+        Handig om de totalen van de oude integratie over te nemen zonder een bestand te verplaatsen:
+        ``import_totals: {<periode>: {<modus>: {electrical: kWh, thermal: kWh}}}``.
+        """
+        totals = self.args.get("import_totals")
+        if not isinstance(totals, dict):
+            return
+        count = 0
+        for period in self.PERIODS:
+            section = totals.get(period)
+            if not isinstance(section, dict):
+                continue
+            for mode in self.MODES:
+                values = section.get(mode)
+                if not isinstance(values, dict):
+                    continue
+                electrical = max(0.0, self._num(values.get("electrical")))
+                thermal = self._num(values.get("thermal"))
+                self.data[period][mode]["energy"] = {"electrical": electrical, "thermal": thermal}
+                count += 1
+        if count:
+            self._dirty = True
+            self.log(f"{count} tellers overgenomen uit import_totals. Verwijder die optie na deze start.")
+        else:
+            self.warning("import_totals bevat geen bruikbare waarden (verwacht <periode>: <modus>: electrical/thermal).")
 
     def _check_storage_writable(self):
         try:
@@ -1257,15 +1294,26 @@ class COPCalculator(hass.Hass):
             "compressor_seconds": 0.0,
             "inactive_seconds": 0.0,
             "total_seconds": 0.0,
+            "non_integer": False,
         }
 
     def _track_dhw_temp(self, run, temp):
-        """Tel alleen stijgingen groter dan de deadband (filtert sensorruis)."""
+        """Tel alleen stijgingen groter dan de deadband (filtert sensorruis).
+
+        Meldt de sensor uitsluitend hele graden, dan knippert hij tussen twee waarden zodra de
+        echte temperatuur bij een afrondgrens blijft hangen. Elke terugval zou dan als nieuwe
+        stijging tellen. Daarom geldt voor zo'n sensor minstens INTEGER_SENSOR_DEADBAND.
+        """
         run["last_temp"] = temp
-        if temp >= run["ref_temp"] + self.dhw_temp_deadband:
+        if abs(temp - round(temp)) > 1e-6:
+            run["non_integer"] = True
+        deadband = self.dhw_temp_deadband
+        if not run.get("non_integer"):
+            deadband = max(deadband, self.INTEGER_SENSOR_DEADBAND)
+        if temp >= run["ref_temp"] + deadband:
             run["rise_sum"] += temp - run["ref_temp"]
             run["ref_temp"] = temp
-        elif temp <= run["ref_temp"] - self.dhw_temp_deadband:
+        elif temp <= run["ref_temp"] - deadband:
             run["ref_temp"] = temp
 
     def _track_dhw(self, now, elapsed, mode, dhw_heater, dhw_temp, loop_thermal):
