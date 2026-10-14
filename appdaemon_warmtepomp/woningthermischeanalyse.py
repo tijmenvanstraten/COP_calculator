@@ -2,8 +2,49 @@ import appdaemon.plugins.hass.hassapi as hass
 import pymysql
 import math
 import datetime
+import os
 
 class WoningThermischeAnalyse(hass.Hass):
+
+    def _get_db_config(self):
+        required = {
+            "host": "HA_DB_HOST",
+            "user": "HA_DB_USER",
+            "database": "HA_DB_NAME",
+        }
+        db_config = {}
+        missing = []
+        for config_key, env_key in required.items():
+            value = os.environ.get(env_key)
+            if not value:
+                missing.append(env_key)
+            else:
+                db_config[config_key] = value
+
+        password_file = os.environ.get("HA_DB_PASSWORD_FILE")
+        if password_file:
+            with open(password_file, encoding="utf-8") as secret_file:
+                password = secret_file.read().strip()
+        else:
+            password = os.environ.get("HA_DB_PASSWORD")
+        if not password:
+            missing.append("HA_DB_PASSWORD or HA_DB_PASSWORD_FILE")
+
+        port_value = os.environ.get("HA_DB_PORT", "3306")
+        try:
+            port = int(port_value)
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError as err:
+            raise ValueError("HA_DB_PORT must be an integer between 1 and 65535") from err
+
+        if missing:
+            raise ValueError(
+                "Missing database configuration: " + ", ".join(missing)
+            )
+
+        db_config.update({"password": password, "port": port})
+        return db_config
 
     def initialize(self):
         self.log("--- Start App Woning Thermische Analyse ---")
@@ -13,15 +54,6 @@ class WoningThermischeAnalyse(hass.Hass):
         #self.run_in(self.bereken_constantes, 10)
 
     def bereken_constantes(self, kwargs):
-        # DB CONFIGURATIE (Zelf invullen)
-        db_config = {
-            'host': 'secret', 
-            'user': 'secret',
-            'password': 'secret',
-            'database': 'secret',
-            'port': secret
-        }
-
         # ENTITY CONFIGURATIE
         binnen_sensor = 'sensor.woonkamer_temperatuur_gemiddeld'
         buiten_sensor = 'sensor.kantoor_buiten_temperatuur'
@@ -48,6 +80,7 @@ class WoningThermischeAnalyse(hass.Hass):
         """
 
         try:
+            db_config = self._get_db_config()
             self.log("Verbinding maken met database...")
             conn = pymysql.connect(**db_config)
             self.log("Verbonden! Query uitvoeren...")
