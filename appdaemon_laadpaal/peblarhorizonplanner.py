@@ -175,7 +175,7 @@ class PeblarHorizonPlanner(hass.Hass):
                 self._noodstand_zonladen()
 
     def _register_services(self):
-        self.listen_service(self._annuleer_planning_service, self.ANNULEER_SERVICE)
+        self.listen_event(self._annuleer_planning_service, "call_service", service=self.ANNULEER_SERVICE)
 
     def _set_plan_status(self, status: str, message: Optional[str] = None):
         if status != "in_uitvoering":
