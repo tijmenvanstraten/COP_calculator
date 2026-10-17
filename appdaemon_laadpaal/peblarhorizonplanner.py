@@ -66,7 +66,6 @@ class PeblarHorizonPlanner(hass.Hass):
     # Persistentie instellingen
     PERSISTENCE_ENTITY = "input_text.peblar_horizon_planner_persistent_data"
     PERSISTENCE_ENABLED = True
-    GRAPH_DATA_ENTITY = "sensor.peblar_horizon_planner_graph_data"
     GRAFIEK_ENTITY = "sensor.peblar_horizon_planner_grafiek"
     PLAN_STATUS_ENTITY = "sensor.peblar_horizon_planner_plan_status"
     PLAN_BEREKEN_BUTTON = "input_button.ford_capri_ev_start_laadplan_berekening"
@@ -96,7 +95,7 @@ class PeblarHorizonPlanner(hass.Hass):
     LOCAL_TZ_NAME = "Europe/Amsterdam"
 
     def initialize(self):
-        self.log("Peblar Horizon Planner v13.2 (core forecast) opgestart.")
+        self.log("Peblar Horizon Planner v13.4 (core forecast) opgestart.")
         self._lock = threading.RLock()
         self._load_configuration()
         self._local_tz = tz.gettz(self.LOCAL_TZ_NAME)
@@ -127,11 +126,11 @@ class PeblarHorizonPlanner(hass.Hass):
         self._minimum_off_timer = None
         self._progress_update_timer = None
         self._sensor_storingen = 0
-        self._graph_page_counts = {}
         self._last_progress_kwh = None
         self._eigen_commandos = []
         self._sturing_actief = False
         self._netlaadplan = False
+        self._plan_waarschuwing = ""
         self.planning_geannuleerd = False
         self._plan_status = "geen_plan"
         self._plan_message = None
@@ -297,6 +296,10 @@ class PeblarHorizonPlanner(hass.Hass):
             aan = str(self.get_state(self.peblar_switch_entity)).lower() == "on"
             self._set_desired_state("pure_solar", aan, self.MAX_PAAL_KW if aan else 0.0)
 
+    def _concept_bericht(self) -> str:
+        bericht = "Wacht op goedkeuring via de uitvoerschakelaar."
+        return f"{bericht} {self._plan_waarschuwing}" if self._plan_waarschuwing else bericht
+
     def _geef_sturing_vrij(self):
         """Het script laat de paal los en valt terug op zonladen, maar alleen als het script de
         paal op dat moment bestuurde. Zonder actief plan blijft de paal met rust (handmatig sturen kan)."""
@@ -326,7 +329,7 @@ class PeblarHorizonPlanner(hass.Hass):
             self.last_plan_calculation = None
             self.bereken_laadplan()
             if self.last_plan_calculation is not None:
-                self._set_plan_status("concept", "Wacht op goedkeuring via de uitvoerschakelaar.")
+                self._set_plan_status("concept", self._concept_bericht())
             elif self._wacht_op_forecast:
                 self._set_plan_status("wacht_op_forecast", "Forecast beschikbaar? Bereken het plan opnieuw via de knop.")
             elif not self._is_auto_verbonden():
@@ -436,7 +439,6 @@ class PeblarHorizonPlanner(hass.Hass):
         self.MIN_LAADVERMOGEN_ZON_KW = float(self.args.get("min_laadvermogen_zon_kw", self.MIN_LAADVERMOGEN_ZON_KW))
         self.PERSISTENCE_ENTITY = self.args.get("persistence_entity", self.PERSISTENCE_ENTITY)
         self.PERSISTENCE_ENABLED = bool(self.args.get("persistence_enabled", self.PERSISTENCE_ENABLED))
-        self.GRAPH_DATA_ENTITY = self.args.get("graph_data_entity", self.GRAPH_DATA_ENTITY)
         self.GRAFIEK_ENTITY = self.args.get("grafiek_entity", self.GRAFIEK_ENTITY)
         self.ANNULEER_EVENT = self.args.get("annuleer_event", self.ANNULEER_EVENT)
         self.FORECAST_MAX_AGE_MINUTES = int(self.args.get("forecast_max_age_minutes", self.FORECAST_MAX_AGE_MINUTES))
@@ -1115,9 +1117,6 @@ class PeblarHorizonPlanner(hass.Hass):
                 "epex_prijs": fc_slot["epex_prijs"],
                 "pv_kw": fc_slot["pv_kw"],
                 "verbruik_kw": verbruik_kw,
-                "pv_kwh": pv_kw * duration_hours,
-                "verbruik_kwh": verbruik_kw * duration_hours,
-                "zon_overschot_kwh": max(0.0, pv_kw - verbruik_kw) * duration_hours,
                 "prijs_bron": fc_slot["prijs_bron"],
             })
             slot_start = slot_end
@@ -1203,7 +1202,19 @@ class PeblarHorizonPlanner(hass.Hass):
         netto_behoefte_kwh = max(0.0, ((doel_soc - effectieve_soc) / 100.0) * self.ACCU_CAP_KWH)
         laad_behoefte_kwh = netto_behoefte_kwh / self.LAADRENDEMENT
         self.log(f"SoC: {effectieve_soc:.1f}% -> {doel_soc:.1f}% (+{self.VEILIGHEIDSMARGE_PERCENT}% marge). "
-                 f"Netladen behoefte: {netto_behoefte_kwh:.2f} kWh ({laad_behoefte_kwh:.2f} kWh uit het net)")
+                 f"Energie naar de accu: {netto_behoefte_kwh:.2f} kWh; laadenergie aan de paal "
+                 f"(incl. verliezen, zon + net samen): {laad_behoefte_kwh:.2f} kWh")
+        # Waarschuwing als de gewenste afstand niet haalbaar is (doel-SoC wordt dan afgekapt op 100%)
+        nodig_soc = (gewenste_km / km_per_procent) + self.VEILIGHEIDSMARGE_PERCENT
+        if nodig_soc > 100.0:
+            max_km = max(0.0, (100.0 - self.VEILIGHEIDSMARGE_PERCENT) * km_per_procent)
+            self._plan_waarschuwing = (
+                f"Let op: {gewenste_km:.0f} km is niet haalbaar (vraagt ~{nodig_soc:.0f}% SoC incl. marge); "
+                f"het plan laadt tot 100% (ca. {max_km:.0f} km)."
+            )
+        else:
+            self._plan_waarschuwing = ""
+        self._log_bij_verandering("doel_onhaalbaar", self._plan_waarschuwing or None)
 
         forecast = self._lees_forecast()
         if forecast is None:
@@ -1239,11 +1250,11 @@ class PeblarHorizonPlanner(hass.Hass):
             self._bereken_zonladen_plan()
 
         if self.plan:
-            start = min(self.plan.keys()).strftime("%Y-%m-%d %H:%M")
-            end = max(self.plan.keys()).strftime("%Y-%m-%d %H:%M")
+            start = min(self.plan.keys()).astimezone(self._local_tz).strftime("%d-%m %H:%M")
+            end = (max(self.plan.keys()) + datetime.timedelta(minutes=15)).astimezone(self._local_tz).strftime("%d-%m %H:%M")
             zon_total = sum(v['zon_kwh'] for v in self.plan.values())
             net_total = sum(v['net_kwh'] for v in self.plan.values())
-            self.log(f"Plan: {start}–{end} | Zon: {zon_total:.2f} kWh | Net: {net_total:.2f} kWh")
+            self.log(f"Plan (lokale tijd): {start} tot {end} | Zon: {zon_total:.2f} kWh | Net: {net_total:.2f} kWh")
         else:
             self.log("Geen netladen nodig, alleen zonladen.")
 
@@ -1262,7 +1273,7 @@ class PeblarHorizonPlanner(hass.Hass):
 
         self.last_plan_calculation = nu
         if concept:
-            self._set_plan_status("concept", "Wacht op goedkeuring via de uitvoerschakelaar.")
+            self._set_plan_status("concept", self._concept_bericht())
         else:
             self._plan_start_time = nu
             self._plan_start_meterstand = huidige_energie
@@ -1534,262 +1545,65 @@ class PeblarHorizonPlanner(hass.Hass):
                 self._geef_sturing_vrij()
                 self._save_persistent_data()
 
+    PLAN_SCHEMA_VERSIE = 1
+
     def _update_graph_data(self):
+        """Publiceert het plan voor de grafiek (zie _publish_plan_sensor)."""
         try:
-            nu = datetime.datetime.now(tz.UTC)
-            generated_at = nu.isoformat()
-            if not self.matrix_kwartieren:
-                attributes = {
-                    "friendly_name": "Peblar Horizon Planner Graph Data",
-                    "icon": "mdi:chart-line",
-                    "device_class": "timestamp",
-                    "generated_at": generated_at,
-                    "slot_count": 0,
-                    "data_entities": {},
-                    "metadata": {"plan_status": self._plan_status},
-                    "tijden": [],
-                    "epex_tarieven": [],
-                    "totaal_tarieven": [],
-                    "zon_opwek": [],
-                    "zon_overschot": [],
-                    "huis_verbruik": [],
-                    "laadplanning_zon": [],
-                    "laadplanning_net": [],
-                    "prijs_bron": [],
-                }
-                self._markeer_graph_paginas_stale(generated_at)
-                self.set_state(self.GRAPH_DATA_ENTITY, state=generated_at, attributes=attributes)
-                self._publish_grafiek_sensor(generated_at)
-                return
-
-            tijden = []
-            epex_tarieven = []
-            totaal_tarieven = []
-            zon_opwek = []
-            zon_overschot = []
-            huis_verbruik = []
-            prijs_bron = []
-            laadplanning_zon = []
-            laadplanning_net = []
-            for u in self.matrix_kwartieren:
-                tijden.append(u["tijd"].strftime("%Y-%m-%d %H:%M"))
-                epex_tarieven.append(round(u["epex_prijs"], 4))
-                totaal_tarieven.append(round(u["net_prijs"], 4))
-                zon_opwek.append(round(u["pv_kwh"], 3))                  # echte PV-opbrengst, kWh per kwartier
-                zon_overschot.append(round(u["zon_overschot_kwh"], 3))   # PV minus huisverbruik
-                huis_verbruik.append(round(u["verbruik_kwh"], 3))        # kWh per kwartier
-                prijs_bron.append(u["prijs_bron"])
-                plan_entry = self.plan.get(u["tijd"], {"zon_kwh": 0.0, "net_kwh": 0.0})
-                laadplanning_zon.append(round(plan_entry.get("zon_kwh", 0.0), 3))
-                laadplanning_net.append(round(plan_entry.get("net_kwh", 0.0), 3))
-
-            graph_topics = {
-                "tijden": {},
-                "prijzen": {
-                    "epex_tarieven": epex_tarieven,
-                    "totaal_tarieven": totaal_tarieven,
-                    "prijs_bron": prijs_bron,
-                },
-                "energie": {
-                    "zon_opwek": zon_opwek,
-                    "zon_overschot": zon_overschot,
-                    "huis_verbruik": huis_verbruik,
-                },
-                "planning": {
-                    "laadplanning_zon": laadplanning_zon,
-                    "laadplanning_net": laadplanning_net,
-                },
-            }
-            data_entities = {
-                topic: self._publish_graph_topic(
-                    topic,
-                    tijden,
-                    fields,
-                    generated_at,
-                    include_tijden=(topic == "tijden"),
-                )
-                for topic, fields in graph_topics.items()
-            }
-            metadata = {
-                "eenheden": {"prijzen": "EUR/kWh", "energie": "kWh per kwartier"},
-                "energiebelasting": self._tarief_meta.get("energiebelasting"),
-                "leverancierskosten": self._tarief_meta.get("leverancierskosten"),
-                "btw": self._tarief_meta.get("btw"),
-                "laadrendement": self.LAADRENDEMENT,
-                "forecast_status": self._forecast_status,
-                "plan_status": self._plan_status,
-                "fallback_prijs_kwartieren": sum(
-                    1 for u in self.matrix_kwartieren if u["prijs_bron"] == "fallback"
-                ),
-            }
-            legacy_data = {
-                "tijden": tijden,
-                "epex_tarieven": epex_tarieven,
-                "totaal_tarieven": totaal_tarieven,
-                "zon_opwek": zon_opwek,
-                "zon_overschot": zon_overschot,
-                "huis_verbruik": huis_verbruik,
-                "laadplanning_zon": laadplanning_zon,
-                "laadplanning_net": laadplanning_net,
-                "prijs_bron": prijs_bron,
-            }
-            attributes = {
-                "friendly_name": "Peblar Horizon Planner Graph Data",
-                "icon": "mdi:chart-line",
-                "device_class": "timestamp",
-                "generated_at": generated_at,
-                "slot_count": len(self.matrix_kwartieren),
-                "data_entities": data_entities,
-                "data_schema_version": 2,
-                "data_alignment": "Concatenate pages in page order; align topic values by start_index and slot_count.",
-                "legacy_arrays_available": False,
-                "metadata": metadata,
-            }
-            legacy_attributes = {**attributes, **legacy_data}
-            if len(json.dumps(legacy_attributes, separators=(",", ":")).encode("utf-8")) <= self.GRAPH_ATTRIBUTE_MAX_BYTES:
-                attributes["legacy_arrays_available"] = True
-                attributes.update(legacy_data)
-            self.set_state(self.GRAPH_DATA_ENTITY, state=generated_at, attributes=attributes)
-            self._publish_grafiek_sensor(generated_at)
+            self._publish_plan_sensor()
         except Exception as e:
             self.error(f"Fout bij updaten grafiek data: {self._sanitize_error(e)}")
 
-    _GRAFIEK_REEKSEN = ("epex_tarief", "totaal_tarief", "zon_opwek", "zon_overschot",
-                        "huis_verbruik", "zon_laden", "net_laden")
+    def _publish_plan_sensor(self):
+        """Plan per kwartier voor de grafiek, in dezelfde opzet als de forecast-sensor van de predictor.
 
-    def _publish_grafiek_sensor(self, generated_at: str):
-        """Compacte feed voor ApexCharts: één sensor, alle reeksen uitgelijnd per kwartier.
-
-        Tijdstip van kwartier i = start_ms + i * stap_ms (epoch in milliseconden). Er zijn dus geen
-        losse tijdstempels die kunnen verschuiven of in de verkeerde tijdzone worden gelezen.
-        Energiereeksen zijn in kWh per kwartier, tarieven in EUR/kWh. Waarden van 0 blijven staan.
+        Attribuut 'plan' = lijst met per kwartier {"tijd", "zon_laden_kwh", "net_laden_kwh"} in kWh per kwartier.
+        Elk kwartier heeft een eigen 'tijd' en ook kwartieren zonder planning staan erin (met 0), zodat de kaart
+        de punten 1-op-1 kan overnemen. Verdwijnt een nul bij het schrijven (bekende AppDaemon-eigenaardigheid),
+        dan blijft het item staan en geldt een ontbrekende waarde als 0.
+        De lijst loopt tot één kwartier na het laatst geplande kwartier, zodat de laatste trapstap in de grafiek
+        een breedte heeft. PV, verbruik en tarieven staan alleen in de forecast-sensor.
         """
-        stap_ms = 15 * 60 * 1000
+        nu = datetime.datetime.now(tz.UTC)
+        generated_at = nu.isoformat()
+        kwartier = datetime.timedelta(minutes=15)
+        matrix = self.matrix_kwartieren
+
+        alle = []
+        for u in matrix:
+            entry = self.plan.get(u["tijd"], {})
+            alle.append({
+                "tijd": u["tijd"].isoformat(),
+                "zon_laden_kwh": round(entry.get("zon_kwh", 0.0), 3),
+                "net_laden_kwh": round(entry.get("net_kwh", 0.0), 3),
+            })
+        laatste = max((n for n, it in enumerate(alle) if it["zon_laden_kwh"] > 0 or it["net_laden_kwh"] > 0), default=-1)
+        items = alle[: laatste + 2] if laatste >= 0 else []
+
         basis = {
             "friendly_name": "Peblar Horizon Planner Grafiek",
             "icon": "mdi:chart-areaspline",
+            "device_class": "timestamp",
+            "schema_versie": self.PLAN_SCHEMA_VERSIE,
+            "matrix_eenheid": "kwh_per_kwartier",
             "generated_at": generated_at,
-            "stap_ms": stap_ms,
-            "eenheden": {"tarief": "EUR/kWh", "energie": "kWh per kwartier"},
+            "kwartier_minuten": 15,
             "plan_status": self._plan_status,
+            "horizon_start": matrix[0]["tijd"].isoformat() if matrix else None,
+            "horizon_einde": (matrix[-1]["tijd"] + kwartier).isoformat() if matrix else None,
+            "zon_laden_totaal_kwh": round(sum(it["zon_laden_kwh"] for it in alle), 3),
+            "net_laden_totaal_kwh": round(sum(it["net_laden_kwh"] for it in alle), 3),
         }
-        matrix = self.matrix_kwartieren
-        if not matrix:
-            self.set_state(self.GRAFIEK_ENTITY, state=generated_at, attributes={
-                **basis, "start_ms": None, "slot_count": 0, "afgekapt": False,
-                **{naam: [] for naam in self._GRAFIEK_REEKSEN},
-            })
-            return
-        data = {naam: [] for naam in self._GRAFIEK_REEKSEN}
-        for u in matrix:
-            entry = self.plan.get(u["tijd"], {})
-            data["epex_tarief"].append(round(u["epex_prijs"], 4))
-            data["totaal_tarief"].append(round(u["net_prijs"], 4))
-            data["zon_opwek"].append(round(u["pv_kwh"], 3))
-            data["zon_overschot"].append(round(u["zon_overschot_kwh"], 3))
-            data["huis_verbruik"].append(round(u["verbruik_kwh"], 3))
-            data["zon_laden"].append(round(entry.get("zon_kwh", 0.0), 3))
-            data["net_laden"].append(round(entry.get("net_kwh", 0.0), 3))
-        start_ms = int(matrix[0]["tijd"].timestamp() * 1000)
 
         def bouw(aantal: int) -> Dict[str, Any]:
-            return {**basis, "start_ms": start_ms, "slot_count": aantal,
-                    "afgekapt": aantal < len(matrix),
-                    **{naam: waarden[:aantal] for naam, waarden in data.items()}}
+            return {**basis, "slot_count": aantal, "afgekapt": aantal < len(items), "plan": items[:aantal]}
 
-        aantal = len(matrix)
+        aantal = len(items)
         attributes = bouw(aantal)
         while aantal > 1 and len(json.dumps(attributes, separators=(",", ":")).encode("utf-8")) > self.GRAPH_ATTRIBUTE_MAX_BYTES:
             aantal = int(aantal * 0.9)
             attributes = bouw(aantal)
         self.set_state(self.GRAFIEK_ENTITY, state=generated_at, attributes=attributes)
-
-    def _publish_graph_topic(
-        self,
-        topic: str,
-        tijden: list,
-        fields: Dict[str, list],
-        generated_at: str,
-        include_tijden: bool = False,
-    ) -> list:
-        pages = []
-        start_index = 0
-        page_data = {**({"tijden": []} if include_tijden else {}), **{field: [] for field in fields}}
-
-        def slot_count(data):
-            if include_tijden:
-                return len(data["tijden"])
-            return len(next(iter(data.values())))
-
-        def attributes_for(data, page_number, start, page_count=9999):
-            return {
-                "friendly_name": f"Peblar Horizon Planner {topic}",
-                "generated_at": generated_at,
-                "topic": topic,
-                "page": page_number,
-                "page_count": page_count,
-                "start_index": start,
-                "slot_count": slot_count(data),
-                **data,
-            }
-
-        for index, tijd in enumerate(tijden):
-            if include_tijden:
-                page_data["tijden"].append(tijd)
-            for field, values in fields.items():
-                page_data[field].append(values[index])
-            size = len(json.dumps(
-                attributes_for(page_data, len(pages) + 1, start_index),
-                separators=(",", ":"),
-                ensure_ascii=True,
-            ).encode("utf-8"))
-            if size > self.GRAPH_ATTRIBUTE_MAX_BYTES:
-                for values in page_data.values():
-                    values.pop()
-                if slot_count(page_data) == 0:
-                    raise ValueError(f"Een grafiekwaarde voor '{topic}' overschrijdt de attribuutlimiet.")
-                pages.append((start_index, page_data))
-                start_index = index
-                page_data = {
-                    **({"tijden": [tijd]} if include_tijden else {}),
-                    **{field: [values[index]] for field, values in fields.items()},
-                }
-
-        if slot_count(page_data):
-            pages.append((start_index, page_data))
-
-        entity_ids = []
-        for page_number, (start, data) in enumerate(pages, start=1):
-            entity_id = f"{self.GRAPH_DATA_ENTITY}_{topic}_{page_number}"
-            self.set_state(
-                entity_id,
-                state=generated_at,
-                attributes=attributes_for(data, page_number, start, len(pages)),
-            )
-            entity_ids.append(entity_id)
-        self._markeer_graph_paginas_stale(generated_at, topic=topic, vanaf=len(entity_ids) + 1)
-        self._graph_page_counts[topic] = len(entity_ids)
-        return entity_ids
-
-    def _markeer_graph_paginas_stale(self, generated_at: str, topic: Optional[str] = None, vanaf: int = 1):
-        """Pagina-entiteiten uit een eerdere berekening kunnen niet worden verwijderd; markeer ze als leeg."""
-        topics = [topic] if topic is not None else list(self._graph_page_counts.keys())
-        for naam in topics:
-            for nummer in range(vanaf, self._graph_page_counts.get(naam, 0) + 1):
-                self.set_state(
-                    f"{self.GRAPH_DATA_ENTITY}_{naam}_{nummer}",
-                    state="leeg",
-                    attributes={
-                        "friendly_name": f"Peblar Horizon Planner {naam}",
-                        "generated_at": generated_at,
-                        "topic": naam,
-                        "page": nummer,
-                        "slot_count": 0,
-                        "stale": True,
-                    },
-                )
-            if topic is None:
-                self._graph_page_counts[naam] = 0
 
     def _set_desired_state(self, modus: str, power_on: bool, vermogen_kw: float):
         with self._lock:
