@@ -47,6 +47,9 @@ class PeblarHorizonPlanner(hass.Hass):
     EXTERN_AMPERE_TOLERANTIE = 0.6
     # Reactie op een wijziging van schakelaar/modus/limiet die niet van het script komt
     # (alleen tijdens een goedgekeurd plan): "alleen_loggen" of "pauzeren"
+    # Opties van de select 'Smart charging' in de Peblar-integratie (de sleutels, niet de weergavenamen)
+    MODUS_DEFAULT = "default"
+    MODUS_ZON = "smart_solar"
     EXTERNE_WIJZIGING_ACTIE = "alleen_loggen"
     EXTERNE_WIJZIGING_ENTITEITEN = ("switch", "modus", "limiet")
     MIN_LAADVERMOGEN_ZON_KW = 1.38
@@ -86,6 +89,7 @@ class PeblarHorizonPlanner(hass.Hass):
         "peblar_status_entity": "sensor.peblar_ev_charger_status",
         "push_notification_entity": "notify.mobile_app_iphone",
         "plan_bereken_button_entity": "input_button.ford_capri_ev_start_laadplan_berekening",
+        "annuleer_button_entity": "input_button.ford_capri_ev_annuleer_laadplan",
         "plan_uitvoeren_boolean_entity": "input_boolean.ford_capri_ev_uitvoeren_laadplan",
         "plan_status_entity": "sensor.peblar_horizon_planner_plan_status",
     }
@@ -95,7 +99,7 @@ class PeblarHorizonPlanner(hass.Hass):
     LOCAL_TZ_NAME = "Europe/Amsterdam"
 
     def initialize(self):
-        self.log("Peblar Horizon Planner v13.4 (core forecast) opgestart.")
+        self.log("Peblar Horizon Planner v13.6 (core forecast) opgestart.")
         self._lock = threading.RLock()
         self._load_configuration()
         self._local_tz = tz.gettz(self.LOCAL_TZ_NAME)
@@ -118,7 +122,7 @@ class PeblarHorizonPlanner(hass.Hass):
         self.last_mode_call = None
         self.last_switch_call = None
         self.last_laadlimiet_call = None
-        self._desired_mode = "pure_solar"
+        self._desired_mode = self.MODUS_ZON
         self._desired_power_on = False
         self._desired_kw = 0.0
         self._control_generation = 0
@@ -175,9 +179,12 @@ class PeblarHorizonPlanner(hass.Hass):
                 self._noodstand_zonladen()
 
     def _register_services(self):
-        # Aanroepen vanuit Home Assistant: event "peblar_horizon_planner_annuleer_planning" afvuren
-        # (bijv. via een script met de actie "event:"). Een call_service-event bestaat alleen voor
-        # services die in Home Assistant zelf geregistreerd zijn.
+        # Annuleren kan op twee manieren:
+        # 1. een input_button (helper) in Home Assistant indrukken (annuleer_button_entity);
+        # 2. het event "peblar_horizon_planner_annuleer_planning" afvuren (bijv. via een script met de
+        #    actie "event:"). Een call_service-event bestaat alleen voor services die in Home Assistant
+        #    zelf geregistreerd zijn.
+        self.listen_state(self._annuleer_button_ingedrukt, self.annuleer_button_entity)
         self.listen_event(self._annuleer_planning_service, self.ANNULEER_EVENT)
 
     def _set_plan_status(self, status: str, message: Optional[str] = None):
@@ -289,12 +296,12 @@ class PeblarHorizonPlanner(hass.Hass):
         op netladen gelaten: de modus gaat naar Pure solar, de schakelaar blijft zoals hij staat."""
         klasse = self._status_klasse(self.get_state(self.peblar_status_entity))
         if klasse == "losgekoppeld":
-            self._set_desired_state("pure_solar", False, 0.0)
+            self._set_desired_state(self.MODUS_ZON, False, 0.0)
         elif klasse == "verbonden":
-            self._set_desired_state("pure_solar", True, self.MAX_PAAL_KW)
+            self._set_desired_state(self.MODUS_ZON, True, self.MAX_PAAL_KW)
         else:
             aan = str(self.get_state(self.peblar_switch_entity)).lower() == "on"
-            self._set_desired_state("pure_solar", aan, self.MAX_PAAL_KW if aan else 0.0)
+            self._set_desired_state(self.MODUS_ZON, aan, self.MAX_PAAL_KW if aan else 0.0)
 
     def _concept_bericht(self) -> str:
         bericht = "Wacht op goedkeuring via de uitvoerschakelaar."
@@ -311,9 +318,9 @@ class PeblarHorizonPlanner(hass.Hass):
         """Zonder timers (voor terminate): modus naar Pure solar en, bij aangesloten auto, schakelaar aan."""
         try:
             modus = self.get_state(self.peblar_mode_entity)
-            if modus not in (None, "unavailable", "unknown") and modus != "pure_solar":
+            if modus not in (None, "unavailable", "unknown") and modus != self.MODUS_ZON:
                 self.call_service("select/select_option",
-                                  entity_id=self.peblar_mode_entity, option="pure_solar")
+                                  entity_id=self.peblar_mode_entity, option=self.MODUS_ZON)
             klasse = self._status_klasse(self.get_state(self.peblar_status_entity))
             if klasse == "verbonden" and str(self.get_state(self.peblar_switch_entity)).lower() == "off":
                 self.call_service("switch/turn_on", entity_id=self.peblar_switch_entity)
@@ -397,8 +404,25 @@ class PeblarHorizonPlanner(hass.Hass):
 
     def _annuleer_planning_service(self, event_name=None, data=None, *args, **kwargs):
         # AppDaemon roept event-callbacks aan als (event_name, data, kwargs); beide stijlen worden geaccepteerd.
+        self._annuleer_planning("event")
+
+    def _annuleer_button_ingedrukt(self, entity, attribute, old, new, kwargs):
+        """Annuleerknop (input_button). De status van een input_button is het tijdstip van de laatste druk."""
+        if self._is_onbekende_waarde(new) or str(old).strip().lower() == "unavailable":
+            return  # uitval of herstel van de helper is geen druk op de knop
+        try:
+            ingedrukt = datetime.datetime.fromisoformat(str(new))
+            if ingedrukt.tzinfo is None:
+                ingedrukt = ingedrukt.replace(tzinfo=tz.UTC)
+            if abs((datetime.datetime.now(tz.UTC) - ingedrukt).total_seconds()) > 60:
+                return  # herstelde oude waarde na een herstart, geen nieuwe druk
+        except ValueError:
+            pass
+        self._annuleer_planning("knop")
+
+    def _annuleer_planning(self, bron: str):
         with self._lock:
-            self.log("Planning geannuleerd via event.")
+            self.log(f"Planning geannuleerd via {bron}.")
             self.planning_geannuleerd = True
             self._set_execution_boolean(False)
             self._clear_plan()
@@ -423,6 +447,8 @@ class PeblarHorizonPlanner(hass.Hass):
         self.MAX_AMPERE = float(self.args.get("max_ampere", self.MAX_AMPERE))
         self.LAADRENDEMENT = float(self.args.get("laadrendement", self.LAADRENDEMENT))
         self.MAX_SOC_JUMP_PER_QUARTER = float(self.args.get("max_soc_jump", self.MAX_SOC_JUMP_PER_QUARTER))
+        self.MODUS_DEFAULT = str(self.args.get("modus_default", self.MODUS_DEFAULT))
+        self.MODUS_ZON = str(self.args.get("modus_pure_solar", self.MODUS_ZON))
         actie = str(self.args.get("externe_wijziging_actie", self.EXTERNE_WIJZIGING_ACTIE)).strip().lower()
         if actie not in ("alleen_loggen", "pauzeren"):
             self.warning(f"Onbekende externe_wijziging_actie '{actie}'; 'alleen_loggen' wordt gebruikt.")
@@ -512,6 +538,14 @@ class PeblarHorizonPlanner(hass.Hass):
                     f"Forecast status '{self._forecast_status}': {attrs.get('waarschuwingen')}")
             else:
                 self._log_bij_verandering("forecast_status", None)
+
+    def warning(self, msg, *args, **kwargs):
+        """AppDaemon heeft geen warning(): waarschuwingen gaan met level WARNING naar het gewone log."""
+        self.log(msg, level="WARNING")
+
+    def error(self, msg, *args, **kwargs):
+        """Fouten met level ERROR in het gewone log (AppDaemon's error() logt standaard als INFO)."""
+        self.log(msg, level="ERROR")
 
     def _log_bij_verandering(self, sleutel: str, melding: Optional[str]):
         vorige = self._gelogde_meldingen.get(sleutel)
@@ -712,7 +746,7 @@ class PeblarHorizonPlanner(hass.Hass):
         return False
 
     def _verwachte_ampere(self) -> int:
-        kw = self._desired_kw if self._desired_mode == "Default" else self.MAX_PAAL_KW
+        kw = self._desired_kw if self._desired_mode == self.MODUS_DEFAULT else self.MAX_PAAL_KW
         return round(max(self.MIN_AMPERE, min(self.MAX_AMPERE, self._kw_naar_ampere(kw))))
 
     def _verwachte_waarde(self, onderdeel: str):
@@ -887,7 +921,7 @@ class PeblarHorizonPlanner(hass.Hass):
                 self._send_push_notification("Auto Losgekoppeld", f"Auto is losgekoppeld. Status: {new}")
                 self._sturing_actief = False
                 self._set_execution_boolean(False)
-                self._set_desired_state("pure_solar", False, 0.0)
+                self._set_desired_state(self.MODUS_ZON, False, 0.0)
                 self._reset_laadtracking()
                 self._clear_plan()
                 if had_plan:
@@ -1423,7 +1457,7 @@ class PeblarHorizonPlanner(hass.Hass):
                     self.log("Auto losgekoppeld. Harde stop.")
                     self._sturing_actief = False
                     self._set_execution_boolean(False)
-                    self._set_desired_state("pure_solar", False, 0.0)
+                    self._set_desired_state(self.MODUS_ZON, False, 0.0)
                     self._reset_laadtracking()
                     self._clear_plan()
                     self._set_plan_status(
@@ -1518,7 +1552,7 @@ class PeblarHorizonPlanner(hass.Hass):
                                  if huidige_soc is not None else None)
                 if soc_voor_nood is not None and soc_voor_nood < self.MIN_SOC_SAFETY:
                     self.log(f"NOOD: SoC {soc_voor_nood:.1f}% < {self.MIN_SOC_SAFETY}%. Maximaal laden.")
-                    self._set_desired_state("Default", True, self.MAX_PAAL_KW)
+                    self._set_desired_state(self.MODUS_DEFAULT, True, self.MAX_PAAL_KW)
                 # Netladen
                 elif net_kwh > self.TOLERANCE:
                     total_kwh = zon_kwh + net_kwh
@@ -1528,7 +1562,7 @@ class PeblarHorizonPlanner(hass.Hass):
                         kw = self.MIN_LAADVERMOGEN_KW
                     else:
                         kw = min(self.MAX_PAAL_KW, kw)
-                    self._set_state_respecting_minimum_off("Default", True, kw)
+                    self._set_state_respecting_minimum_off(self.MODUS_DEFAULT, True, kw)
                 # Zonladen
                 elif zon_kwh > self.TOLERANCE:
                     self._set_solar_charging_state()
@@ -1616,7 +1650,7 @@ class PeblarHorizonPlanner(hass.Hass):
             needs_switch_change = (current_switch == "on") != power_on
             needs_ampere_change = False
 
-            if power_on and modus == "Default":
+            if power_on and modus == self.MODUS_DEFAULT:
                 desired_ampere = self._kw_naar_ampere(vermogen_kw)
                 desired_ampere = round(max(self.MIN_AMPERE, min(self.MAX_AMPERE, desired_ampere)))
                 needs_ampere_change = (current_ampere is None or abs(current_ampere - desired_ampere) > self.AMPERE_TOLERANCE)
@@ -1674,7 +1708,7 @@ class PeblarHorizonPlanner(hass.Hass):
 
             # Keep the charger limit open in solar mode; a prior Default setpoint
             # must not silently cap solar charging.
-            if self._desired_mode in ("Default", "pure_solar"):
+            if self._desired_mode in (self.MODUS_DEFAULT, self.MODUS_ZON):
                 if self.get_sensor_float(self.peblar_laadlimiet_entity) is None:
                     # Limiet onbekend (sensor niet beschikbaar): deze stap overslaan. Wachten of
                     # eindeloos opnieuw proberen zou ook de schakelaar (en dus zonladen) blokkeren.
@@ -1686,7 +1720,7 @@ class PeblarHorizonPlanner(hass.Hass):
                 else:
                     self._log_bij_verandering("laadlimiet_sensor", None)
                     laadlimiet_kw = (
-                        self._desired_kw if self._desired_mode == "Default" else self.MAX_PAAL_KW
+                        self._desired_kw if self._desired_mode == self.MODUS_DEFAULT else self.MAX_PAAL_KW
                     )
                     if not self._set_laadvermogen(laadlimiet_kw):
                         delay = self._remaining_delay(self.last_laadlimiet_call)
