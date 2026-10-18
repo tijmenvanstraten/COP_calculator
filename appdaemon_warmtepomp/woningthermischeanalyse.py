@@ -157,7 +157,7 @@ class WoningThermischeAnalyse(hass.Hass):
         if isinstance(eigen, dict):
             self.ent.update({k: v for k, v in eigen.items() if k in self.ent and v})
         self.tz = ZoneInfo(str(self.args.get("tijdzone", "Europe/Amsterdam")))
-        self.korte_dagen = max(3, self._arg("korte_dagen", 10, int))          # 5-min statistics/history
+        self.korte_dagen = max(3, self._arg("korte_dagen", 14, int))          # 5-min statistics/history
         self.lange_dagen = max(30, self._arg("lange_dagen", 365, int))         # uurlijkse long-term stats
         self.lang_refresh_dagen = self._arg("lang_refresh_dagen", 7, int)
         self.lag = max(1, self._arg("verschil_kwartieren", 2, int))   # dTin over L kwartieren
@@ -179,7 +179,10 @@ class WoningThermischeAnalyse(hass.Hass):
         self.history_timeout = self._arg("history_timeout_seconden", 120, float)
         self.halfwaarde_dagen = self._arg("halfwaarde_dagen", 7.0, float)
         self.min_delta_t = self._arg("min_delta_t", 3.0, float)
-        self.min_rijen = max(50, self._arg("min_rijen", 300, int))
+        self.min_rijen = max(50, self._arg("min_rijen", 100, int))
+        self.min_thermische_rijen = max(
+            self.min_rijen, self._arg("min_thermische_rijen", 300, int)
+        )
         self.min_rijen_lang = self._arg("min_rijen_lang", 200, int)
         self.min_r2 = self._arg("min_r2", 0.15, float)
         self.max_rel_se_a = self._arg("max_rel_se_a", 0.35, float)
@@ -501,7 +504,7 @@ class WoningThermischeAnalyse(hass.Hass):
             serie[sleutel] = haal(sleutel)
         if self.thermisch:
             th = haal("wp_thermisch_vermogen", verplicht=False)
-            if sum(v is not None for v in th) < self.min_rijen:
+            if sum(v is not None for v in th) < self.min_thermische_rijen:
                 self.log(f"Te weinig statistics voor {self.ent['wp_thermisch_vermogen']}; "
                          f"terugval op elektrisch vermogen.", level="WARNING")
                 self.thermisch = False
@@ -671,24 +674,53 @@ class WoningThermischeAnalyse(hass.Hass):
         n, idx0 = s["n"], s["idx0"]
         i_tot = n - L if i_tot is None else min(i_tot, n - L)
         rijen, touts, heat_p = [], [], []
+        afwijzingen = {
+            "ontbrekende_binnentemperatuur": 0,
+            "ontbrekende_buitentemperatuur": 0,
+            "ontbrekende_pv": 0,
+            "ontbrekende_wind": 0,
+            "ontbrekend_wp_vermogen": 0,
+            "onvoldoende_ema_opwarming": 0,
+            "ontbrekende_wp_status": 0,
+            "uitgesloten_warmtepompstatus": 0,
+            "klein_temperatuurverschil": 0,
+        }
         for i in range(i_van, i_tot):
             ks = range(i, i + L + 1)
             if s["binnen"][i] is None or s["binnen"][i + L] is None:
+                afwijzingen["ontbrekende_binnentemperatuur"] += 1
                 continue
-            ok = True
+            afwijsreden = None
             for k in ks:
-                if (s["binnen"][k] is None or s["buiten"][k] is None or s["pv"][k] is None
-                        or s["wind"][k] is None or s["pheat"][k] is None or not s["ema_ok"][k]
-                        or s["excl"][k] is None or s["excl"][k] > self.excl_drempel):
-                    ok = False
+                ontbrekende_data = (
+                    ("ontbrekende_binnentemperatuur", s["binnen"][k]),
+                    ("ontbrekende_buitentemperatuur", s["buiten"][k]),
+                    ("ontbrekende_pv", s["pv"][k]),
+                    ("ontbrekende_wind", s["wind"][k]),
+                    ("ontbrekend_wp_vermogen", s["pheat"][k]),
+                    ("ontbrekende_wp_status", s["excl"][k]),
+                )
+                afwijsreden = next(
+                    (reden for reden, waarde in ontbrekende_data if waarde is None),
+                    None,
+                )
+                if afwijsreden:
                     break
-            if not ok:
+                if not s["ema_ok"][k]:
+                    afwijsreden = "onvoldoende_ema_opwarming"
+                    break
+                if s["excl"][k] > self.excl_drempel:
+                    afwijsreden = "uitgesloten_warmtepompstatus"
+                    break
+            if afwijsreden:
+                afwijzingen[afwijsreden] += 1
                 continue
             m = lambda key: sum(w * s[key][k] for w, k in zip(wk, ks))  # noqa: E731
             tin, tout, wind, pv = m("binnen"), m("buiten"), m("wind"), m("pv")
             pf, ps, dag = m("pheat"), m("ema"), m("dag")
             dt = tout - tin
             if abs(dt) < self.min_delta_t:
+                afwijzingen["klein_temperatuurverschil"] += 1
                 continue
             y = (s["binnen"][i + L] - s["binnen"][i]) / (L * self.KWARTIER_H)
             x = [dt, wind * dt, pv, pf, ps, ps * (tout - self.REF_TOUT) / 10.0, 1.0, dag]
@@ -698,7 +730,7 @@ class WoningThermischeAnalyse(hass.Hass):
             touts.append(tout)
             if pf > self.HEAT_P_MIN:
                 heat_p.append(pf)
-        return rijen, touts, heat_p
+        return rijen, touts, heat_p, afwijzingen
 
     # ---------------------------------------------------------------- simulatie / backtest
     def _stap_model(self, c, tin, tout, wind, pv, pf, ps, dag):
@@ -754,9 +786,14 @@ class WoningThermischeAnalyse(hass.Hass):
         # 1. kies de tijdconstante van de trage WP-component (lichte vloer vs. beton)
         beste = None
         scores = {}
+        beste_afwijzingen = None
+        meeste_rijen = 0
         for tau in self.tau_kandidaten:
             self._prepareer(s, self.KWARTIER_S, tau, kort=True, warm_uur=self.EMA_WARMUP_UUR)
-            rijen, touts, heat_p = self._rijen_kort(s)
+            rijen, touts, heat_p, afwijzingen = self._rijen_kort(s)
+            if len(rijen) > meeste_rijen:
+                meeste_rijen = len(rijen)
+                beste_afwijzingen = afwijzingen
             if len(rijen) < self.min_rijen:
                 continue
             fit = self._fit_model(rijen, self.NAMEN_KORT, tout_bereik(touts), uitsluiten)
@@ -766,15 +803,26 @@ class WoningThermischeAnalyse(hass.Hass):
             if beste is None or fit["resid_std"] < beste["fit"]["resid_std"]:
                 beste = {"tau": tau, "fit": fit, "heat_p": heat_p}
         if beste is None:
-            return None, {"status": "degraded", "redenen": [f"te weinig bruikbare rijen (< {self.min_rijen})"]}
+            reden = (
+                f"te weinig bruikbare rijen ({meeste_rijen} < {self.min_rijen})"
+                if meeste_rijen < self.min_rijen
+                else f"regressie mislukt met voldoende rijen ({meeste_rijen})"
+            )
+            return None, {
+                "status": "degraded",
+                "bruikbare_rijen": meeste_rijen,
+                "min_rijen": self.min_rijen,
+                "rij_afwijzingen": beste_afwijzingen or {},
+                "redenen": [reden],
+            }
         tau, fit = beste["tau"], beste["fit"]
         self._prepareer(s, self.KWARTIER_S, tau, kort=True, warm_uur=self.EMA_WARMUP_UUR)
-        rijen, touts, _ = self._rijen_kort(s)
+        rijen, touts, _, _ = self._rijen_kort(s)
 
         # 2. backtest: hold-out (fit zonder laatste dagen) of anders in-sample
         bt, bt_type = None, "hold_out"
         if heeft_holdout:
-            rijen_tr, touts_tr, _ = self._rijen_kort(s, 0, cut)
+            rijen_tr, touts_tr, _, _ = self._rijen_kort(s, 0, cut)
             if len(rijen_tr) >= self.min_rijen // 2:
                 fit_tr = self._fit_model(rijen_tr, self.NAMEN_KORT, tout_bereik(touts_tr), uitsluiten)
                 if fit_tr:
@@ -892,22 +940,45 @@ class WoningThermischeAnalyse(hass.Hass):
         lang_info = nieuw_opslag.get("lang")
         lang_fit = None
         verouderd = True
-        if lang_info and lang_info.get("bijgewerkt"):
+        laatste_lang_poging = nieuw_opslag.get("lang_laatste_poging")
+        laatste_poging_dt = None
+        if isinstance(laatste_lang_poging, dict):
             try:
-                leeftijd = (nu - datetime.datetime.fromisoformat(lang_info["bijgewerkt"])).days
-                verouderd = leeftijd >= self.lang_refresh_dagen
+                laatste_poging_dt = datetime.datetime.fromisoformat(
+                    laatste_lang_poging.get("laatste_poging", "")
+                )
             except ValueError:
                 pass
-        if verouderd or kort is None:
+        laatste_succes_dt = None
+        if isinstance(lang_info, dict):
+            try:
+                laatste_succes_dt = datetime.datetime.fromisoformat(
+                    lang_info.get("bijgewerkt", "")
+                )
+            except ValueError:
+                pass
+        if laatste_poging_dt and (
+            laatste_succes_dt is None or laatste_poging_dt > laatste_succes_dt
+        ):
+            verouderd = (nu - laatste_poging_dt).days >= self.lang_refresh_dagen
+        elif laatste_succes_dt:
+            verouderd = (nu - laatste_succes_dt).days >= self.lang_refresh_dagen
+        if verouderd:
             try:
                 lang_fit, info = self._lange_fit(nu)
                 if lang_fit is not None:
                     lang_info = info
                     nieuw_opslag["lang"] = info
+                    nieuw_opslag.pop("lang_laatste_poging", None)
                 else:
+                    info["laatste_poging"] = nu.isoformat()
                     nieuw_opslag["lang_laatste_poging"] = info
             except Exception as err:  # noqa: BLE001
                 self.log(f"Long-term fit mislukt: {err!r}", level="WARNING")
+                nieuw_opslag["lang_laatste_poging"] = {
+                    "laatste_poging": nu.isoformat(),
+                    "reden": str(err),
+                }
 
         oud = nieuw_opslag.get("coef") or {}
         nieuw, bron, n = None, None, 0
@@ -928,7 +999,12 @@ class WoningThermischeAnalyse(hass.Hass):
         nieuw_opslag["kwaliteit"] = kw
         nieuw_opslag["laatste_run"] = nu.isoformat()
         if nieuw is None:
-            self.log(f"Geen bruikbare fit; vorige waarden blijven: {kw.get('redenen')}", level="WARNING")
+            self.log(
+                "Geen bruikbare fit; vorige waarden blijven: "
+                f"{kw.get('redenen')}; rijen={kw.get('bruikbare_rijen')}/"
+                f"{kw.get('min_rijen')}; afwijzingen={kw.get('rij_afwijzingen')}.",
+                level="WARNING",
+            )
         else:
             oud_meta = nieuw_opslag.get("meta", {})
             invoer = kw.get("invoer") if kort else oud_meta.get("invoer")
