@@ -77,7 +77,9 @@ class WoningThermischeAnalyse(hass.Hass):
         "operation_state_dhw_off", "operation_state_cool_demand_off",
         "operation_state_cool_thermo_off", "off",
     ]
-    # Alle andere (gekende) toestanden (dhw_on, cool_thermo_on, alarm, ...) worden uitgesloten.
+    # Uitgesloten worden alleen toestanden die één van deze tekstdelen bevatten (DHW aan, koelen aan,
+    # alarm, defrost). Alle andere toestanden gelden als "niet verwarmend" en blijven in de data.
+    WP_UITSLUITEN = ("dhw_on", "swp_on", "cool_thermo_on", "cool_demand_on", "alarm", "defrost", "error")
     WP_ONBEKEND = ("", "unknown", "unavailable", "none")
 
     # Modelconstanten (voorheen magic numbers)
@@ -180,6 +182,8 @@ class WoningThermischeAnalyse(hass.Hass):
         self.halfwaarde_dagen = self._arg("halfwaarde_dagen", 7.0, float)
         self.min_delta_t = self._arg("min_delta_t", 3.0, float)
         self.min_rijen = max(50, self._arg("min_rijen", 100, int))
+        # minimaal aantal kwartieren (rijen) met actief verwarmen voor de volledige fit; anders passieve fit
+        self.min_verwarm_rijen = max(10, self._arg("min_verwarm_rijen", 60, int))
         self.min_thermische_rijen = max(
             self.min_rijen, self._arg("min_thermische_rijen", 300, int)
         )
@@ -198,7 +202,7 @@ class WoningThermischeAnalyse(hass.Hass):
         self.max_tout_lang = self._arg("max_buiten_lang", 17.0, float)
         self.pv_missend_is_nul = bool(self.args.get("pv_missend_is_nul", True))
         self.wp_heat = list(self.args.get("wp_verwarmen_states", self.WP_VERWARMEN))
-        self.wp_idle = list(self.args.get("wp_idle_states", self.WP_IDLE))
+        self.wp_uitsluiten = [str(x).lower() for x in self.args.get("wp_uitsluit_states", self.WP_UITSLUITEN)]
         self.data_dir = self.args.get("data_dir") or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "woning_thermische_analyse_data")
         self.opslag_bestand = os.path.join(self.data_dir, "woning_thermische_analyse.json")
@@ -287,7 +291,7 @@ class WoningThermischeAnalyse(hass.Hass):
             ("sensor.huis_interne_winst", e_gem, {
                 "unit_of_measurement": "K/h", "friendly_name": "Huis interne winst (gemiddeld)",
                 "nacht": round(c.get("e0", 0.0), 5), "dag_extra_07_23": round(c.get("e1", 0.0), 5)}),
-            ("sensor.huis_verwarming_gain", g0, gain_attr),
+            ("sensor.huis_verwarming_gain", g0 if "g_snel" in c else None, gain_attr),
         ]
         for entity, waarde, extra in sensoren:
             if waarde is not None:
@@ -442,12 +446,14 @@ class WoningThermischeAnalyse(hass.Hass):
             return None
         if state in self.wp_heat:
             return "heat"
-        if state in self.wp_idle:
-            return "idle"
-        return "excl"
+        laag = str(state).lower()
+        if any(deel in laag for deel in self.wp_uitsluiten):
+            return "excl"
+        return "idle"
 
     def _wp_fracties(self, start, einde, idx0, n):
         """Tijdgewogen aandeel per kwartier: (heat, excl) of None bij onvoldoende dekking."""
+        self._status_verdeling = {}
         kwargs = {"entity_id": self.ent["wp_status"], "start_time": start, "end_time": einde}
         try:
             res = self.get_history(timeout=self.history_timeout, **kwargs)
@@ -466,8 +472,12 @@ class WoningThermischeAnalyse(hass.Hass):
             return None
         begin, eind = start.timestamp(), einde.timestamp()
         acc = {"heat": [0.0] * n, "excl": [0.0] * n, "dek": [0.0] * n}
+        seconden = {}
         for (t0, s0), t1 in zip(events, [e[0] for e in events[1:]] + [eind]):
             cls = self._classificeer(s0)
+            duur = min(t1, eind) - max(t0, begin)
+            if duur > 0:
+                seconden[str(s0)] = seconden.get(str(s0), 0.0) + duur
             t, stop = max(t0, begin), min(t1, eind)
             while cls and t < stop:
                 q = int(t // self.KWARTIER_S)
@@ -480,6 +490,11 @@ class WoningThermischeAnalyse(hass.Hass):
                     elif cls == "excl":
                         acc["excl"][i] += seg
                 t += seg
+        totaal = sum(seconden.values()) or 1.0
+        top = sorted(seconden.items(), key=lambda kv: -kv[1])[:10]
+        self._status_verdeling = {s_: f"{100.0 * v / totaal:.1f}% ({self._classificeer(s_) or 'onbekend'})"
+                                  for s_, v in top}
+        self.log("WP-status verdeling: " + ", ".join(f"{k}={v}" for k, v in self._status_verdeling.items()))
         heat, excl = [], []
         for i in range(n):
             if acc["dek"][i] >= self.HISTORY_DEKKING_MIN * self.KWARTIER_S:
@@ -547,9 +562,8 @@ class WoningThermischeAnalyse(hass.Hass):
         s["dag"] = [self._dag_vlag(idx0 + i, stap_s) for i in range(n)]
         if kort:
             s["pheat"] = [
-                None if (p is None or h is None or x is None)
-                else (p if h >= self.HEAT_AAN_DREMPEL and x < self.EXCL_UIT_DREMPEL else 0.0)
-                for p, h, x in zip(s["pt"], s["heat"], s["excl"])]
+                None if (p is None or x is None) else (p if x < self.EXCL_UIT_DREMPEL else 0.0)
+                for p, x in zip(s["pt"], s["excl"])]
         else:
             s["pheat"] = list(s["pt"])
         alpha = 1.0 - math.exp(-stap_h / tau_h)
@@ -667,7 +681,7 @@ class WoningThermischeAnalyse(hass.Hass):
         return res
 
     # ---------------------------------------------------------------- rijen kort model
-    def _rijen_kort(self, s, i_van=0, i_tot=None):
+    def _rijen_kort(self, s, i_van=0, i_tot=None, passief=False):
         L = self.lag
         wk = [0.5] + [1.0] * (L - 1) + [0.5]
         wk = [v / L for v in wk]
@@ -683,6 +697,7 @@ class WoningThermischeAnalyse(hass.Hass):
             "onvoldoende_ema_opwarming": 0,
             "ontbrekende_wp_status": 0,
             "uitgesloten_warmtepompstatus": 0,
+            "wp_actief_of_nasleep": 0,
             "klein_temperatuurverschil": 0,
         }
         for i in range(i_van, i_tot):
@@ -712,6 +727,9 @@ class WoningThermischeAnalyse(hass.Hass):
                 if s["excl"][k] > self.excl_drempel:
                     afwijsreden = "uitgesloten_warmtepompstatus"
                     break
+                if passief and (s["pheat"][k] > self.wp_uit_kw or s["ema"][k] > self.wp_uit_kw):
+                    afwijsreden = "wp_actief_of_nasleep"   # passieve fit: alleen rijen zonder WP-invloed
+                    break
             if afwijsreden:
                 afwijzingen[afwijsreden] += 1
                 continue
@@ -739,7 +757,7 @@ class WoningThermischeAnalyse(hass.Hass):
              + c["e0"] + c["e1"] * dag)
         return tin + d * self.KWARTIER_H
 
-    def _backtest(self, s, c, vanaf):
+    def _backtest(self, s, c, vanaf, passief=False):
         """6 uur vooruit simuleren met werkelijke weer- en WP-invoer (open loop)."""
         H = self.horizon_kw
         fouten, basis = [], []
@@ -751,7 +769,8 @@ class WoningThermischeAnalyse(hass.Hass):
             ok = True
             for k in range(i, i + H):
                 if (s["buiten"][k] is None or s["pv"][k] is None or s["wind"][k] is None
-                        or s["pheat"][k] is None or not s["ema_ok"][k]):
+                        or s["pheat"][k] is None or not s["ema_ok"][k]
+                        or (passief and (s["pheat"][k] > self.wp_uit_kw or s["ema"][k] > self.wp_uit_kw))):
                     ok = False
                     break
             if not ok:
@@ -808,13 +827,10 @@ class WoningThermischeAnalyse(hass.Hass):
                 if meeste_rijen < self.min_rijen
                 else f"regressie mislukt met voldoende rijen ({meeste_rijen})"
             )
-            return None, {
-                "status": "degraded",
-                "bruikbare_rijen": meeste_rijen,
-                "min_rijen": self.min_rijen,
-                "rij_afwijzingen": beste_afwijzingen or {},
-                "redenen": [reden],
-            }
+            return self._passieve_fit(s, reden)
+        if len(beste["heat_p"]) < self.min_verwarm_rijen:
+            return self._passieve_fit(
+                s, f"te weinig verwarmingsrijen ({len(beste['heat_p'])} < {self.min_verwarm_rijen})")
         tau, fit = beste["tau"], beste["fit"]
         self._prepareer(s, self.KWARTIER_S, tau, kort=True, warm_uur=self.EMA_WARMUP_UUR)
         rijen, touts, _, _ = self._rijen_kort(s)
@@ -840,6 +856,8 @@ class WoningThermischeAnalyse(hass.Hass):
         redenen = []
         c = fit["coef"]
         g0 = c["g_snel"] + c["g_traag"]
+        if g0 <= 0:
+            return self._passieve_fit(s, "geen positief WP-effect gevonden (g <= 0)")
         tau_huis = 1.0 / c["a"] if c["a"] > 0 else None
         if tau_huis is None or not (self.tau_huis_bereik[0] <= tau_huis <= self.tau_huis_bereik[1]):
             redenen.append(f"tijdconstante huis {tau_huis if tau_huis is None else round(tau_huis, 1)} h buiten bereik")
@@ -873,8 +891,73 @@ class WoningThermischeAnalyse(hass.Hass):
             "mae_persistentie_K": round(bt["mae_persistentie"], 3) if bt else None,
             "mae_vorig_model_K": round(bt_oud["mae"], 3) if bt_oud else None,
             "backtest_n": bt["n"] if bt else 0,
+            "wp_status_verdeling": getattr(self, "_status_verdeling", {}),
+            "modus": "volledig", "verwarm_rijen": len(beste["heat_p"]),
             "redenen": redenen, "status": "ok" if not redenen else "degraded",
         }
+        return (fit if not redenen else None), kw
+
+    def _passieve_fit(self, s: dict, aanleiding: str):
+        """Terugval bij weinig of geen verwarmingsdata (bijv. mild weer): alleen verlies, zon, wind en
+        interne winst. Rijen waarin de WP draait of nog nawarmt blijven buiten de fit; de WP-termen
+        (g) worden niet geschat en de vorige waarden blijven staan."""
+        self._prepareer(s, self.KWARTIER_S, self.tau_traag_h, kort=True, warm_uur=self.EMA_WARMUP_UUR)
+        uitsluiten = ("g_snel", "g_traag", "g_t")
+        rijen, _touts, _hp, afw = self._rijen_kort(s, passief=True)
+        kw = {
+            "modus": "passief", "aanleiding": aanleiding,
+            "invoer": "thermisch" if self.thermisch else "elektrisch",
+            "bruikbare_rijen": len(rijen), "min_rijen": self.min_rijen, "rij_afwijzingen": afw,
+            "wp_status_verdeling": getattr(self, "_status_verdeling", {}),
+            "status": "degraded", "redenen": [],
+        }
+        if len(rijen) < self.min_rijen:
+            kw["redenen"] = [aanleiding, f"passieve fit: te weinig rijen zonder WP ({len(rijen)} < {self.min_rijen})"]
+            return None, kw
+        fit = self._fit_model(rijen, self.NAMEN_KORT, None, uitsluiten)
+        if fit is None:
+            kw["redenen"] = [aanleiding, "passieve regressie mislukt (singulier)"]
+            return None, kw
+        heeft_holdout = s["n"] > self.HOLDOUT_MIN_DAGEN * 96
+        cut = s["n"] - int(self.holdout_dagen * 96) if heeft_holdout else 0
+        bt, bt_type = None, "hold_out"
+        if heeft_holdout:
+            rijen_tr = self._rijen_kort(s, 0, cut, passief=True)[0]
+            if len(rijen_tr) >= self.min_rijen // 2:
+                fit_tr = self._fit_model(rijen_tr, self.NAMEN_KORT, None, uitsluiten)
+                if fit_tr:
+                    bt = self._backtest(s, fit_tr["coef"], cut, passief=True)
+        if bt is None:
+            bt, bt_type = self._backtest(s, fit["coef"], 0, passief=True), "in_sample"
+        redenen = []
+        c = fit["coef"]
+        tau_huis = 1.0 / c["a"] if c["a"] > 0 else None
+        if tau_huis is None or not (self.tau_huis_bereik[0] <= tau_huis <= self.tau_huis_bereik[1]):
+            redenen.append(f"tijdconstante huis {tau_huis if tau_huis is None else round(tau_huis, 1)} h buiten bereik")
+        se_a = fit["se"].get("a")
+        if c["a"] > 0 and se_a is not None and se_a / c["a"] > self.max_rel_se_a:
+            redenen.append(f"a onzeker (se/a = {se_a / c['a']:.2f})")
+        if c["b"] > self.MAX_B or c["c"] > self.MAX_C:
+            redenen.append("b of c buiten plausibel bereik")
+        if fit["r2"] < self.min_r2:
+            redenen.append(f"R2 {fit['r2']:.2f} < {self.min_r2}")
+        if bt is None:
+            redenen.append("passieve backtest niet mogelijk (te weinig aaneengesloten WP-vrije uren)")
+        else:
+            if bt["mae"] > bt["mae_persistentie"]:
+                redenen.append(f"model slechter dan 'blijft gelijk' ({bt['mae']:.2f} vs {bt['mae_persistentie']:.2f} K)")
+            if bt["mae"] > self.max_mae:
+                redenen.append(f"MAE {bt['mae']:.2f} K > {self.max_mae} K")
+        fit["modus"], fit["tau"], fit["p_typ"] = "passief", self.tau_traag_h, None
+        kw.update({
+            "n": fit["n"], "r2": round(fit["r2"], 3), "resid_std_Kh": round(fit["resid_std"], 3),
+            "a_se": round(se_a, 5) if se_a is not None else None,
+            "tau_huis_uur": round(tau_huis, 1) if tau_huis else None,
+            "backtest_type": bt_type, "mae_6u_K": round(bt["mae"], 3) if bt else None,
+            "mae_persistentie_K": round(bt["mae_persistentie"], 3) if bt else None,
+            "backtest_n": bt["n"] if bt else 0,
+            "redenen": redenen, "status": "ok" if not redenen else "degraded",
+        })
         return (fit if not redenen else None), kw
 
     # ================================================================ LANGE FIT (long-term)
@@ -981,9 +1064,20 @@ class WoningThermischeAnalyse(hass.Hass):
                 }
 
         oud = nieuw_opslag.get("coef") or {}
+        oud_meta = nieuw_opslag.get("meta", {})
+        if kort is not None and oud_meta.get("invoer") not in (None, kw.get("invoer")):
+            # eenheid van de g-termen verandert (kW_e <-> kW_th): niet middelen met oude waarden
+            self.log("WP-invoer gewijzigd; g-termen worden niet met oude waarden gemiddeld.", level="WARNING")
+            oud = {k: v for k, v in oud.items() if k not in ("g_snel", "g_traag", "g_t")}
+        passief = bool(kort is not None and kort.get("modus") == "passief")
         nieuw, bron, n = None, None, 0
         if kort is not None:
             nieuw, bron, n = dict(kort["coef"]), "kort", kort["n"]
+            if passief:
+                # alleen verlies/zon/wind/interne winst bijwerken; WP-termen blijven zoals ze waren
+                bron = "kort_passief"
+                nieuw = {k: v for k, v in nieuw.items() if k in ("a", "b", "c", "e0", "e1")}
+                nieuw.update({k: oud[k] for k in ("g_snel", "g_traag", "g_t") if k in oud})
             la = (lang_info or {}).get("a")
             if la and abs(nieuw["a"] - la) / la > 0.5:
                 kw["afwijking_lang"] = f"a (kort {nieuw['a']:.4f}) wijkt >50% af van long-term ({la:.4f})"
@@ -1002,26 +1096,29 @@ class WoningThermischeAnalyse(hass.Hass):
             self.log(
                 "Geen bruikbare fit; vorige waarden blijven: "
                 f"{kw.get('redenen')}; rijen={kw.get('bruikbare_rijen')}/"
-                f"{kw.get('min_rijen')}; afwijzingen={kw.get('rij_afwijzingen')}.",
+                f"{kw.get('min_rijen')}; afwijzingen={kw.get('rij_afwijzingen')}; "
+                f"wp_status={kw.get('wp_status_verdeling')}.",
                 level="WARNING",
             )
         else:
-            oud_meta = nieuw_opslag.get("meta", {})
             invoer = kw.get("invoer") if kort else oud_meta.get("invoer")
-            if kort and oud_meta.get("invoer") not in (None, invoer):
-                # eenheid van de g-termen verandert (kW_e <-> kW_th): niet middelen met oude waarden
-                self.log("WP-invoer gewijzigd; g-termen worden niet met oude waarden gemiddeld.", level="WARNING")
-                oud = {k: v for k, v in oud.items() if k not in ("g_snel", "g_traag", "g_t")}
             alpha = self.smoothing if oud else 1.0
-            coef = {k: (oud[k] + alpha * (nieuw[k] - oud[k]) if k in oud else nieuw[k]) for k in self.GLAD}
-            g0 = coef["g_snel"] + coef["g_traag"]
-            p_typ = kort.get("p_typ") if kort else oud_meta.get("p_typ")
-            tau_traag = kort["tau"] if kort else oud_meta.get("tau_traag_uur", self.tau_traag_h)
+            coef = {}
+            for k in self.GLAD:
+                if k in nieuw:   # g-termen ontbreken zolang er nog geen verwarmingsdata is geweest
+                    coef[k] = oud[k] + alpha * (nieuw[k] - oud[k]) if k in oud else nieuw[k]
+            heeft_g = "g_snel" in coef and "g_traag" in coef
+            g0 = coef["g_snel"] + coef["g_traag"] if heeft_g else None
+            p_typ = (kort.get("p_typ") if kort else None) or oud_meta.get("p_typ")
+            if kort is None or passief:
+                tau_traag = oud_meta.get("tau_traag_uur", self.tau_traag_h)
+            else:
+                tau_traag = kort["tau"]
             meta = {"bron": bron, "n": n, "tau_traag_uur": tau_traag,
-                    "invoer": invoer,
+                    "invoer": invoer, "modus": "passief" if passief else "volledig",
                     "p_typ": round(p_typ, 3) if p_typ else None,
-                    "opwarm": round(g0 * p_typ, 4) if p_typ else oud_meta.get("opwarm")}
-            if invoer == "thermisch" and g0 > 0:
+                    "opwarm": round(g0 * p_typ, 4) if (g0 and p_typ) else oud_meta.get("opwarm")}
+            if invoer == "thermisch" and g0 and g0 > 0:
                 meta["c_kwh_k"] = round(1.0 / g0, 2)                      # kWh_th per K
                 meta["ua_w_k"] = round(coef["a"] / g0 * 1000.0, 1)        # W/K
             nieuw_opslag["coef"] = coef
@@ -1034,7 +1131,9 @@ class WoningThermischeAnalyse(hass.Hass):
             self.tau_traag_h = float(tau_traag)
             self.log(
                 f"Analyse klaar ({bron}, n={n}): tau_huis={1 / coef['a']:.0f} h, a={coef['a']:.4f}, "
-                f"b={coef['b']:.3f} K/h/kW, c={coef['c']:.5f}, g={g0:.3f} K/h/kW, tau_traag={tau_traag} h, "
+                f"b={coef['b']:.3f} K/h/kW, c={coef['c']:.5f}, "
+                f"g={'%.3f K/h/kW' % g0 if g0 is not None else 'nog onbekend (geen verwarmingsdata)'}, "
+                f"tau_traag={tau_traag} h, "
                 f"e0={coef['e0']:.3f}, e1={coef['e1']:.3f}; MAE6u={kw.get('mae_6u_K')}.")
         with self._opslag_lock:
             self.opslag = nieuw_opslag
