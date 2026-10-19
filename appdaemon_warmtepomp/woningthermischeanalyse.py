@@ -109,6 +109,18 @@ class WoningThermischeAnalyse(hass.Hass):
     }
     MAX_ONGELDIG_AANDEEL = 0.05     # meer dan 5% buiten bereik -> waarschuwing (eenheid?)
 
+    # Uitvoer: (sensor, helper). Bestaat de helper, dan wordt alleen de helper bijgewerkt (jouw template-sensor
+    # leest die en behoudt zo zijn historie); bestaat hij niet, dan zet het script de sensor zelf met set_state.
+    UITVOER = {
+        "afkoel": ("sensor.huis_afkoel_constante", "input_number.huis_afkoel_constante_helper"),
+        "solar": ("sensor.huis_solar_gain_constante", "input_number.huis_solar_gain_constante_helper"),
+        "wind": ("sensor.huis_wind_loss_factor", "input_number.huis_wind_loss_factor_helper"),
+        "opwarm": ("sensor.huis_opwarm_constante", "input_number.huis_opwarm_constante_helper"),
+        "interne_winst": ("sensor.huis_interne_winst", "input_number.huis_interne_winst_helper"),
+        "verwarming_gain": ("sensor.huis_verwarming_gain", "input_number.huis_verwarming_gain_helper"),
+    }
+    KWALITEIT_SENSOR = "sensor.huis_model_kwaliteit"
+
     KWARTIER_S = 900
     KWARTIER_H = 0.25
     REF_TOUT = 7.0
@@ -123,6 +135,12 @@ class WoningThermischeAnalyse(hass.Hass):
         self._opslag_lock = threading.Lock()   # korte lock voor het wisselen/lezen van self.opslag
         self._laad_config()
         self.opslag = self._lees_opslag()      # copy-on-write: wordt nooit in-place gewijzigd
+        a_opgeslagen = (self.opslag.get("coef") or {}).get("a")
+        if a_opgeslagen is not None and not (
+                a_opgeslagen > 0 and self.tau_huis_bereik[0] <= 1.0 / a_opgeslagen <= self.tau_huis_bereik[1]):
+            self.log(f"Opgeslagen a={a_opgeslagen} valt buiten het toegestane bereik; opgeslagen waarden gewist.",
+                     level="WARNING")
+            self.opslag["coef"], self.opslag["meta"] = {}, {}
         opgeslagen_tau = self.opslag.get("tau_traag_uur")
         if isinstance(opgeslagen_tau, (int, float)) and self.TAU_MIN_UUR <= opgeslagen_tau <= self.TAU_MAX_UUR:
             self.tau_traag_h = float(opgeslagen_tau)
@@ -191,7 +209,7 @@ class WoningThermischeAnalyse(hass.Hass):
         self.min_r2 = self._arg("min_r2", 0.15, float)
         self.max_rel_se_a = self._arg("max_rel_se_a", 0.35, float)
         self.tau_huis_bereik = (self._arg("tau_huis_min_uur", 10.0, float),
-                                self._arg("tau_huis_max_uur", 400.0, float))
+                                self._arg("tau_huis_max_uur", 250.0, float))
         self.max_mae = self._arg("max_mae_6u", 0.6, float)
         self.horizon_kw = self._arg("backtest_horizon_kwartieren", 24, int)
         self.holdout_dagen = max(0.0, self._arg("holdout_dagen", 2.0, float))
@@ -208,6 +226,14 @@ class WoningThermischeAnalyse(hass.Hass):
         self.opslag_bestand = os.path.join(self.data_dir, "woning_thermische_analyse.json")
         self.stats_pauze = self._arg("stats_pauze_seconden", 0.05, float)
         self.stats_timeout = self._arg("stats_timeout_seconden", 60, float)
+        self.a_prior_entity = self.args.get("a_prior_entity", "input_number.huis_afkoel_constante_helper")
+        self.uitvoer = {k: tuple(v) for k, v in self.UITVOER.items()}
+        eigen_uitvoer = self.args.get("uitvoer")
+        if isinstance(eigen_uitvoer, dict):
+            for k, v in eigen_uitvoer.items():
+                if k in self.uitvoer and isinstance(v, dict):
+                    self.uitvoer[k] = (v.get("sensor", self.uitvoer[k][0]), v.get("helper", self.uitvoer[k][1]))
+        self._uitvoer_modus = {}
         # optionele vaste 'a' (1/h) voor als de korte fit die niet kan bepalen en er geen long-term fit is
         a_prior = self._arg("a_prior", 0.0, float)
         self.a_prior = a_prior if (a_prior > 0 and
@@ -254,19 +280,59 @@ class WoningThermischeAnalyse(hass.Hass):
                     self.log(f"set_state {entity} mislukt: {err!r}", level="WARNING")
         return False
 
+    def _zet_helper(self, helper: str, waarde: float) -> bool:
+        """Schrijft naar een input_number-helper (alleen bij verandering en binnen min/max)."""
+        waarde = round(float(waarde), 5)
+        try:
+            huidig = self.get_state(helper)
+            if huidig not in (None, "unknown", "unavailable") and abs(float(huidig) - waarde) < 1e-9:
+                return True
+        except (TypeError, ValueError):
+            pass
+        for attr, buiten in (("min", lambda lim: waarde < lim), ("max", lambda lim: waarde > lim)):
+            try:
+                lim = self.get_state(helper, attribute=attr)
+                if lim is not None and buiten(float(lim)):
+                    self.log(f"{helper}: waarde {waarde} valt buiten {attr}={lim}; pas min/max van de helper aan.",
+                             level="WARNING")
+                    return False
+            except (TypeError, ValueError):
+                pass
+        try:
+            self.call_service("input_number/set_value", entity_id=helper, value=waarde)
+            return True
+        except Exception as err:  # noqa: BLE001
+            self.log(f"input_number.set_value {helper} mislukt: {err!r}", level="WARNING")
+            return False
+
+    def _publiceer_waarde(self, sleutel: str, waarde: float, attrs: dict) -> None:
+        sensor, helper = self.uitvoer[sleutel]
+        if helper and self.entity_exists(helper):
+            self._uitvoer_modus[sleutel] = f"helper:{helper}"
+            self._zet_helper(helper, waarde)
+            return
+        self._uitvoer_modus[sleutel] = f"sensor:{sensor}"
+        # state als tekst: AppDaemon laat een numerieke 0.0 anders weg en HA geeft dan 400 Bad Request
+        self._zet_sensor(sensor, str(round(float(waarde), 5)), {**attrs, "state_class": "measurement"})
+
     def _publiceer(self) -> None:
-        """Publiceert alle sensoren vanuit de laatst opgeslagen (copy-on-write) toestand."""
+        """Publiceert alle uitvoer vanuit de laatst opgeslagen (copy-on-write) toestand."""
         with self._opslag_lock:
             opslag = self.opslag
         c = opslag.get("coef") or {}
         kw = opslag.get("kwaliteit")
-        if not c:
-            # nog geen geaccepteerde fit: toon in elk geval waarom (zichtbaar in HA)
-            if kw:
-                self._zet_sensor("sensor.huis_model_kwaliteit", kw.get("status", "unknown"),
-                                 {"friendly_name": "Huis thermisch model kwaliteit", **kw})
-            return
         meta = opslag.get("meta", {})
+
+        def kwaliteit():
+            if kw:
+                extra = {"parameters": {k: round(v, 5) for k, v in c.items()},
+                         "uitvoer_via": dict(self._uitvoer_modus)}
+                self._zet_sensor(self.KWALITEIT_SENSOR, kw.get("status", "unknown"),
+                                 {"friendly_name": "Huis thermisch model kwaliteit", **kw, **extra})
+
+        if not c:
+            kwaliteit()   # nog geen geaccepteerde fit: toon in elk geval waarom
+            return
         basis = {
             "datapunten": meta.get("n"),
             "bron": meta.get("bron"),
@@ -286,28 +352,26 @@ class WoningThermischeAnalyse(hass.Hass):
             "tau_traag_uur": meta.get("tau_traag_uur"),
             "warmtecapaciteit_kwh_per_k": meta.get("c_kwh_k"), "ua_w_per_k": meta.get("ua_w_k"),
         }
-        sensoren = [
-            ("sensor.huis_afkoel_constante", c.get("a"), {
+        uitvoer = [
+            ("afkoel", c.get("a"), {
                 "unit_of_measurement": "1/h", "friendly_name": "Huis afkoelconstante (UA/C)",
                 "tijdconstante_uur": round(1.0 / a, 1) if a > 0 else None}),
-            ("sensor.huis_solar_gain_constante", c.get("b"), {
+            ("solar", c.get("b"), {
                 "unit_of_measurement": "K/h/kW", "friendly_name": "Huis zonnewinst per kW PV"}),
-            ("sensor.huis_wind_loss_factor", c.get("c"), {
+            ("wind", c.get("c"), {
                 "unit_of_measurement": "1/h per km/h", "friendly_name": "Huis extra verlies per km/h wind"}),
-            ("sensor.huis_opwarm_constante", meta.get("opwarm"), {
+            ("opwarm", meta.get("opwarm"), {
                 "unit_of_measurement": "K/h", "friendly_name": "Huis bruto opwarmsnelheid (WP aan, 7 C)",
                 "typisch_vermogen_kw": meta.get("p_typ")}),
-            ("sensor.huis_interne_winst", e_gem, {
+            ("interne_winst", e_gem, {
                 "unit_of_measurement": "K/h", "friendly_name": "Huis interne winst (gemiddeld)",
                 "nacht": round(c.get("e0", 0.0), 5), "dag_extra_07_23": round(c.get("e1", 0.0), 5)}),
-            ("sensor.huis_verwarming_gain", g0 if "g_snel" in c else None, gain_attr),
+            ("verwarming_gain", g0 if "g_snel" in c else None, gain_attr),
         ]
-        for entity, waarde, extra in sensoren:
+        for sleutel, waarde, extra in uitvoer:
             if waarde is not None:
-                self._zet_sensor(entity, round(float(waarde), 5), {**basis, **extra})
-        if kw:
-            self._zet_sensor("sensor.huis_model_kwaliteit", kw.get("status", "unknown"),
-                             {"friendly_name": "Huis thermisch model kwaliteit", **kw})
+                self._publiceer_waarde(sleutel, float(waarde), {**basis, **extra})
+        kwaliteit()
 
     # ---------------------------------------------------------------- triggers
     def _handmatig(self, *_args, **_kwargs):
@@ -693,6 +757,19 @@ class WoningThermischeAnalyse(hass.Hass):
         return res
 
     # ---------------------------------------------------------------- rijen kort model
+    def _a_uit_helper(self):
+        """Eerder bekende 'a' uit een helper (standaard die van het oorspronkelijke script) als voorlopige waarde."""
+        ent = self.a_prior_entity
+        if not ent or not self.entity_exists(ent):
+            return None
+        try:
+            waarde = float(self.get_state(ent))
+        except (TypeError, ValueError):
+            return None
+        if waarde > 0 and self.tau_huis_bereik[0] <= 1.0 / waarde <= self.tau_huis_bereik[1]:
+            return waarde
+        return None
+
     def _fit_model_a(self, rijen, alle_namen, tout_bereik, uitsluiten, a_vast=None):
         """Als _fit_model, maar met 'a' vastgezet (bijv. uit de long-term fit) wanneer a_vast is opgegeven.
         Handig in mild weer: 'a' en de constante interne winst zijn dan niet los van elkaar te schatten."""
@@ -1030,12 +1107,17 @@ class WoningThermischeAnalyse(hass.Hass):
             return None, {"n": len(rijen), "reden": "regressie mislukt"}
         a = fit["coef"]["a"]
         tau = 1.0 / a if a > 0 else None
-        if tau is None or not (self.tau_huis_bereik[0] <= tau <= self.tau_huis_bereik[1]) or fit["r2"] < 0.1:
+        se_a = fit["se"].get("a")
+        se_rel = se_a / a if (a > 0 and se_a is not None) else None
+        if (tau is None or not (self.tau_huis_bereik[0] <= tau <= self.tau_huis_bereik[1]) or fit["r2"] < 0.1
+                or se_rel is None or se_rel > self.max_rel_se_a):
             return None, {"n": fit["n"], "r2": round(fit["r2"], 3), "tau_uur": tau and round(tau, 1),
-                          "reden": "onbetrouwbaar"}
+                          "a_se_rel": se_rel and round(se_rel, 2),
+                          "reden": "onbetrouwbaar (a buiten bereik of te onzeker)"}
         return fit, {"n": fit["n"], "r2": round(fit["r2"], 3), "tau_uur": round(tau, 1),
                      "a": round(a, 5), "b": round(fit["coef"]["b"], 4), "c": round(fit["coef"]["c"], 6),
                      "e0": round(fit["coef"]["e0"], 5), "e1": round(fit["coef"]["e1"], 5),
+                     "a_se_rel": round(se_rel, 3), "versie": 2,
                      "bijgewerkt": nu.isoformat()}
 
     # ================================================================ ORKESTRATIE
@@ -1047,6 +1129,10 @@ class WoningThermischeAnalyse(hass.Hass):
         nieuw_opslag = dict(self.opslag)   # copy-on-write: self.opslag zelf wordt niet aangepast
 
         lang_info = nieuw_opslag.get("lang")
+        if isinstance(lang_info, dict) and lang_info.get("versie") != 2:
+            self.log("Oude long-term fit (zonder onzekerheidscontrole) wordt genegeerd.")
+            lang_info = None
+            nieuw_opslag.pop("lang", None)
         lang_fit = None
         verouderd = True
         laatste_lang_poging = nieuw_opslag.get("lang_laatste_poging")
@@ -1103,6 +1189,10 @@ class WoningThermischeAnalyse(hass.Hass):
             a_ref, a_bron = lang_coef["a"], "long-term"
         elif self.a_prior:
             a_ref, a_bron = self.a_prior, "a_prior"
+        else:
+            a_help = self._a_uit_helper()
+            if a_help:
+                a_ref, a_bron = a_help, f"helper {self.a_prior_entity}"
         kort, kw = self._korte_fit(nu)
         a_gerelateerd = any(("tijdconstante" in r) or ("a onzeker" in r) or r.startswith("R2")
                             for r in kw.get("redenen", []))
@@ -1170,6 +1260,9 @@ class WoningThermischeAnalyse(hass.Hass):
             if invoer == "thermisch" and g0 and g0 > 0:
                 meta["c_kwh_k"] = round(1.0 / g0, 2)                      # kWh_th per K
                 meta["ua_w_k"] = round(coef["a"] / g0 * 1000.0, 1)        # W/K
+                if not (40.0 <= meta["ua_w_k"] <= 400.0):
+                    self.log(f"UA = {meta['ua_w_k']} W/K (C = {meta['c_kwh_k']} kWh/K) lijkt onwaarschijnlijk; "
+                             f"controleer 'a'.", level="WARNING")
             nieuw_opslag["coef"] = coef
             nieuw_opslag["meta"] = meta
             nieuw_opslag["tau_traag_uur"] = tau_traag
