@@ -208,6 +208,10 @@ class WoningThermischeAnalyse(hass.Hass):
         self.opslag_bestand = os.path.join(self.data_dir, "woning_thermische_analyse.json")
         self.stats_pauze = self._arg("stats_pauze_seconden", 0.05, float)
         self.stats_timeout = self._arg("stats_timeout_seconden", 60, float)
+        # optionele vaste 'a' (1/h) voor als de korte fit die niet kan bepalen en er geen long-term fit is
+        a_prior = self._arg("a_prior", 0.0, float)
+        self.a_prior = a_prior if (a_prior > 0 and
+                                   self.tau_huis_bereik[0] <= 1.0 / a_prior <= self.tau_huis_bereik[1]) else None
 
     # ---------------------------------------------------------------- opslag
     def _lees_opslag(self):
@@ -255,7 +259,12 @@ class WoningThermischeAnalyse(hass.Hass):
         with self._opslag_lock:
             opslag = self.opslag
         c = opslag.get("coef") or {}
+        kw = opslag.get("kwaliteit")
         if not c:
+            # nog geen geaccepteerde fit: toon in elk geval waarom (zichtbaar in HA)
+            if kw:
+                self._zet_sensor("sensor.huis_model_kwaliteit", kw.get("status", "unknown"),
+                                 {"friendly_name": "Huis thermisch model kwaliteit", **kw})
             return
         meta = opslag.get("meta", {})
         basis = {
@@ -296,13 +305,16 @@ class WoningThermischeAnalyse(hass.Hass):
         for entity, waarde, extra in sensoren:
             if waarde is not None:
                 self._zet_sensor(entity, round(float(waarde), 5), {**basis, **extra})
-        kw = opslag.get("kwaliteit")
         if kw:
             self._zet_sensor("sensor.huis_model_kwaliteit", kw.get("status", "unknown"),
                              {"friendly_name": "Huis thermisch model kwaliteit", **kw})
 
     # ---------------------------------------------------------------- triggers
     def _handmatig(self, *_args, **_kwargs):
+        """Event `woning_thermische_analyse_run`; met event_data {"lang": true} wordt ook de
+        long-term fit opnieuw berekend (anders hooguit elke `lang_refresh_dagen` dagen)."""
+        data = _args[1] if len(_args) > 1 else {}
+        self._forceer_lang = bool(isinstance(data, dict) and data.get("lang"))
         self.run_in(self.bereken_constantes, 1)
 
     def bereken_constantes(self, kwargs):
@@ -681,6 +693,19 @@ class WoningThermischeAnalyse(hass.Hass):
         return res
 
     # ---------------------------------------------------------------- rijen kort model
+    def _fit_model_a(self, rijen, alle_namen, tout_bereik, uitsluiten, a_vast=None):
+        """Als _fit_model, maar met 'a' vastgezet (bijv. uit de long-term fit) wanneer a_vast is opgegeven.
+        Handig in mild weer: 'a' en de constante interne winst zijn dan niet los van elkaar te schatten."""
+        if a_vast is None:
+            return self._fit_model(rijen, alle_namen, tout_bereik, uitsluiten)
+        rijen2 = [(x, y - a_vast * x[0], w) for x, y, w in rijen]   # x[0] = Tout - Tin
+        res = self._fit_model(rijen2, alle_namen, tout_bereik, tuple(uitsluiten) + ("a",))
+        if res is not None:
+            res["coef"]["a"] = a_vast
+            res["se"]["a"] = None
+            res["a_vast"] = True
+        return res
+
     def _rijen_kort(self, s, i_van=0, i_tot=None, passief=False):
         L = self.lag
         wk = [0.5] + [1.0] * (L - 1) + [0.5]
@@ -786,12 +811,13 @@ class WoningThermischeAnalyse(hass.Hass):
                 "n": len(fouten)}
 
     # ================================================================ KORTE FIT
-    def _korte_fit(self, nu: datetime.datetime):
+    def _korte_fit(self, nu: datetime.datetime, a_vast: float = None, serie: dict = None):
         """Kwartier-fit op de laatste `korte_dagen`; geeft (fit of None, kwaliteitsdict)."""
         einde = datetime.datetime.fromtimestamp(
             (int(nu.timestamp() // self.KWARTIER_S)) * self.KWARTIER_S, datetime.timezone.utc)
         start = einde - datetime.timedelta(days=self.korte_dagen)
-        s = self._bouw_serie(start, einde)
+        s = serie if serie is not None else self._bouw_serie(start, einde)
+        self._serie_cache = s   # hergebruikt bij een tweede poging met vaste a
         uitsluiten = ("g_t",) if self.thermisch else ()
         heeft_holdout = s["n"] > self.HOLDOUT_MIN_DAGEN * 96
         cut = s["n"] - int(self.holdout_dagen * 96) if heeft_holdout else 0
@@ -815,7 +841,7 @@ class WoningThermischeAnalyse(hass.Hass):
                 beste_afwijzingen = afwijzingen
             if len(rijen) < self.min_rijen:
                 continue
-            fit = self._fit_model(rijen, self.NAMEN_KORT, tout_bereik(touts), uitsluiten)
+            fit = self._fit_model_a(rijen, self.NAMEN_KORT, tout_bereik(touts), uitsluiten, a_vast)
             if fit is None:
                 continue
             scores[str(tau)] = round(fit["resid_std"], 4)
@@ -827,10 +853,10 @@ class WoningThermischeAnalyse(hass.Hass):
                 if meeste_rijen < self.min_rijen
                 else f"regressie mislukt met voldoende rijen ({meeste_rijen})"
             )
-            return self._passieve_fit(s, reden)
+            return self._passieve_fit(s, reden, a_vast)
         if len(beste["heat_p"]) < self.min_verwarm_rijen:
             return self._passieve_fit(
-                s, f"te weinig verwarmingsrijen ({len(beste['heat_p'])} < {self.min_verwarm_rijen})")
+                s, f"te weinig verwarmingsrijen ({len(beste['heat_p'])} < {self.min_verwarm_rijen})", a_vast)
         tau, fit = beste["tau"], beste["fit"]
         self._prepareer(s, self.KWARTIER_S, tau, kort=True, warm_uur=self.EMA_WARMUP_UUR)
         rijen, touts, _, _ = self._rijen_kort(s)
@@ -840,7 +866,7 @@ class WoningThermischeAnalyse(hass.Hass):
         if heeft_holdout:
             rijen_tr, touts_tr, _, _ = self._rijen_kort(s, 0, cut)
             if len(rijen_tr) >= self.min_rijen // 2:
-                fit_tr = self._fit_model(rijen_tr, self.NAMEN_KORT, tout_bereik(touts_tr), uitsluiten)
+                fit_tr = self._fit_model_a(rijen_tr, self.NAMEN_KORT, tout_bereik(touts_tr), uitsluiten, a_vast)
                 if fit_tr:
                     bt = self._backtest(s, fit_tr["coef"], cut)
         if bt is None:
@@ -857,9 +883,9 @@ class WoningThermischeAnalyse(hass.Hass):
         c = fit["coef"]
         g0 = c["g_snel"] + c["g_traag"]
         if g0 <= 0:
-            return self._passieve_fit(s, "geen positief WP-effect gevonden (g <= 0)")
+            return self._passieve_fit(s, "geen positief WP-effect gevonden (g <= 0)", a_vast)
         tau_huis = 1.0 / c["a"] if c["a"] > 0 else None
-        if tau_huis is None or not (self.tau_huis_bereik[0] <= tau_huis <= self.tau_huis_bereik[1]):
+        if a_vast is None and (tau_huis is None or not (self.tau_huis_bereik[0] <= tau_huis <= self.tau_huis_bereik[1])):
             redenen.append(f"tijdconstante huis {tau_huis if tau_huis is None else round(tau_huis, 1)} h buiten bereik")
         se_a = fit["se"].get("a")
         if c["a"] > 0 and se_a is not None and se_a / c["a"] > self.max_rel_se_a:
@@ -868,7 +894,7 @@ class WoningThermischeAnalyse(hass.Hass):
             redenen.append("geen positief WP-effect gevonden (g <= 0)")
         if g0 > self.MAX_G or c["b"] > self.MAX_B or c["c"] > self.MAX_C:
             redenen.append("b, c of g buiten plausibel bereik")
-        if fit["r2"] < self.min_r2:
+        if a_vast is None and fit["r2"] < self.min_r2:
             redenen.append(f"R2 {fit['r2']:.2f} < {self.min_r2}")
         if bt is None:
             redenen.append("backtest niet mogelijk (te weinig aaneengesloten data)")
@@ -892,12 +918,12 @@ class WoningThermischeAnalyse(hass.Hass):
             "mae_vorig_model_K": round(bt_oud["mae"], 3) if bt_oud else None,
             "backtest_n": bt["n"] if bt else 0,
             "wp_status_verdeling": getattr(self, "_status_verdeling", {}),
-            "modus": "volledig", "verwarm_rijen": len(beste["heat_p"]),
+            "modus": "volledig", "verwarm_rijen": len(beste["heat_p"]), "a_vast": a_vast,
             "redenen": redenen, "status": "ok" if not redenen else "degraded",
         }
         return (fit if not redenen else None), kw
 
-    def _passieve_fit(self, s: dict, aanleiding: str):
+    def _passieve_fit(self, s: dict, aanleiding: str, a_vast: float = None):
         """Terugval bij weinig of geen verwarmingsdata (bijv. mild weer): alleen verlies, zon, wind en
         interne winst. Rijen waarin de WP draait of nog nawarmt blijven buiten de fit; de WP-termen
         (g) worden niet geschat en de vorige waarden blijven staan."""
@@ -905,7 +931,7 @@ class WoningThermischeAnalyse(hass.Hass):
         uitsluiten = ("g_snel", "g_traag", "g_t")
         rijen, _touts, _hp, afw = self._rijen_kort(s, passief=True)
         kw = {
-            "modus": "passief", "aanleiding": aanleiding,
+            "modus": "passief", "aanleiding": aanleiding, "a_vast": a_vast,
             "invoer": "thermisch" if self.thermisch else "elektrisch",
             "bruikbare_rijen": len(rijen), "min_rijen": self.min_rijen, "rij_afwijzingen": afw,
             "wp_status_verdeling": getattr(self, "_status_verdeling", {}),
@@ -914,7 +940,7 @@ class WoningThermischeAnalyse(hass.Hass):
         if len(rijen) < self.min_rijen:
             kw["redenen"] = [aanleiding, f"passieve fit: te weinig rijen zonder WP ({len(rijen)} < {self.min_rijen})"]
             return None, kw
-        fit = self._fit_model(rijen, self.NAMEN_KORT, None, uitsluiten)
+        fit = self._fit_model_a(rijen, self.NAMEN_KORT, None, uitsluiten, a_vast)
         if fit is None:
             kw["redenen"] = [aanleiding, "passieve regressie mislukt (singulier)"]
             return None, kw
@@ -924,7 +950,7 @@ class WoningThermischeAnalyse(hass.Hass):
         if heeft_holdout:
             rijen_tr = self._rijen_kort(s, 0, cut, passief=True)[0]
             if len(rijen_tr) >= self.min_rijen // 2:
-                fit_tr = self._fit_model(rijen_tr, self.NAMEN_KORT, None, uitsluiten)
+                fit_tr = self._fit_model_a(rijen_tr, self.NAMEN_KORT, None, uitsluiten, a_vast)
                 if fit_tr:
                     bt = self._backtest(s, fit_tr["coef"], cut, passief=True)
         if bt is None:
@@ -932,14 +958,14 @@ class WoningThermischeAnalyse(hass.Hass):
         redenen = []
         c = fit["coef"]
         tau_huis = 1.0 / c["a"] if c["a"] > 0 else None
-        if tau_huis is None or not (self.tau_huis_bereik[0] <= tau_huis <= self.tau_huis_bereik[1]):
+        if a_vast is None and (tau_huis is None or not (self.tau_huis_bereik[0] <= tau_huis <= self.tau_huis_bereik[1])):
             redenen.append(f"tijdconstante huis {tau_huis if tau_huis is None else round(tau_huis, 1)} h buiten bereik")
         se_a = fit["se"].get("a")
         if c["a"] > 0 and se_a is not None and se_a / c["a"] > self.max_rel_se_a:
             redenen.append(f"a onzeker (se/a = {se_a / c['a']:.2f})")
         if c["b"] > self.MAX_B or c["c"] > self.MAX_C:
             redenen.append("b of c buiten plausibel bereik")
-        if fit["r2"] < self.min_r2:
+        if a_vast is None and fit["r2"] < self.min_r2:
             redenen.append(f"R2 {fit['r2']:.2f} < {self.min_r2}")
         if bt is None:
             redenen.append("passieve backtest niet mogelijk (te weinig aaneengesloten WP-vrije uren)")
@@ -1009,6 +1035,7 @@ class WoningThermischeAnalyse(hass.Hass):
                           "reden": "onbetrouwbaar"}
         return fit, {"n": fit["n"], "r2": round(fit["r2"], 3), "tau_uur": round(tau, 1),
                      "a": round(a, 5), "b": round(fit["coef"]["b"], 4), "c": round(fit["coef"]["c"], 6),
+                     "e0": round(fit["coef"]["e0"], 5), "e1": round(fit["coef"]["e1"], 5),
                      "bijgewerkt": nu.isoformat()}
 
     # ================================================================ ORKESTRATIE
@@ -1017,7 +1044,6 @@ class WoningThermischeAnalyse(hass.Hass):
         nu = datetime.datetime.now(datetime.timezone.utc)
         self.log("Thermische analyse gestart.")
         self._controleer_entiteiten()
-        kort, kw = self._korte_fit(nu)
         nieuw_opslag = dict(self.opslag)   # copy-on-write: self.opslag zelf wordt niet aangepast
 
         lang_info = nieuw_opslag.get("lang")
@@ -1046,9 +1072,12 @@ class WoningThermischeAnalyse(hass.Hass):
             verouderd = (nu - laatste_poging_dt).days >= self.lang_refresh_dagen
         elif laatste_succes_dt:
             verouderd = (nu - laatste_succes_dt).days >= self.lang_refresh_dagen
-        if verouderd:
+        forceer_lang = bool(getattr(self, "_forceer_lang", False))
+        self._forceer_lang = False
+        if verouderd or forceer_lang:
             try:
                 lang_fit, info = self._lange_fit(nu)
+                self.log(f"Long-term fit: {info}")
                 if lang_fit is not None:
                     lang_info = info
                     nieuw_opslag["lang"] = info
@@ -1062,6 +1091,26 @@ class WoningThermischeAnalyse(hass.Hass):
                     "laatste_poging": nu.isoformat(),
                     "reden": str(err),
                 }
+
+        # Referentie voor 'a' als de korte fit die in mild weer niet kan bepalen: long-term fit of a_prior
+        lang_coef = None
+        if lang_fit is not None:
+            lang_coef = {k: lang_fit["coef"][k] for k in ("a", "b", "c", "e0", "e1")}
+        elif isinstance(lang_info, dict) and all(k in lang_info for k in ("a", "b", "c", "e0", "e1")):
+            lang_coef = {k: lang_info[k] for k in ("a", "b", "c", "e0", "e1")}
+        a_ref, a_bron = None, None
+        if lang_coef:
+            a_ref, a_bron = lang_coef["a"], "long-term"
+        elif self.a_prior:
+            a_ref, a_bron = self.a_prior, "a_prior"
+        kort, kw = self._korte_fit(nu)
+        a_gerelateerd = any(("tijdconstante" in r) or ("a onzeker" in r) or r.startswith("R2")
+                            for r in kw.get("redenen", []))
+        if kort is None and a_ref and a_gerelateerd:
+            self.log(f"Korte fit kan 'a' niet bepalen ({kw.get('redenen')}); opnieuw met a vast op "
+                     f"{a_ref:.5f} ({a_bron}).")
+            kort, kw = self._korte_fit(nu, a_vast=a_ref, serie=getattr(self, "_serie_cache", None))
+            kw["a_bron"] = a_bron
 
         oud = nieuw_opslag.get("coef") or {}
         oud_meta = nieuw_opslag.get("meta", {})
@@ -1081,12 +1130,12 @@ class WoningThermischeAnalyse(hass.Hass):
             la = (lang_info or {}).get("a")
             if la and abs(nieuw["a"] - la) / la > 0.5:
                 kw["afwijking_lang"] = f"a (kort {nieuw['a']:.4f}) wijkt >50% af van long-term ({la:.4f})"
-        elif lang_fit is not None and oud:
-            # korte fit mislukt: alleen de passieve parameters (a, b, c, e) bijsturen
+        elif lang_coef:
+            # korte fit mislukt: alleen de passieve parameters (a, b, c, e) uit de long-term fit gebruiken
             nieuw = dict(oud)
-            for k in ("a", "b", "c", "e0", "e1"):
-                nieuw[k] = lang_fit["coef"][k]
-            bron, n = "lang", lang_fit["n"]
+            nieuw.update(lang_coef)
+            bron = "lang"
+            n = lang_fit["n"] if lang_fit is not None else (lang_info or {}).get("n", 0)
 
         kw["laatste_run"] = nu.isoformat()
         kw["lang"] = lang_info
