@@ -462,9 +462,9 @@ class COPCalculator(hass.Hass):
         target = f"{path}.corrupt-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
         try:
             os.replace(path, target)
-            self.log(f"Corrupt bestand bewaard als {target}", level="WARNING")
+            self.error(f"Corrupt bestand bewaard als {target}")
         except OSError as error:
-            self.log(f"Kon corrupt bestand {path} niet hernoemen: {error}", level="WARNING")
+            self.error(f"Kon corrupt bestand {path} niet hernoemen: {error}")
 
     def _load_data(self):
         """Laad de data. Geeft het label van de bron terug, of None bij een schone start."""
@@ -534,7 +534,7 @@ class COPCalculator(hass.Hass):
             self._notify(f"COP Calculator kan niet schrijven naar {self.data_dir}: {error}")
 
     def _notify(self, message):
-        self.log(message, level="WARNING")
+        self.error(message)
         try:
             self.call_service(
                 "persistent_notification/create",
@@ -563,7 +563,7 @@ class COPCalculator(hass.Hass):
                 shutil.copy2(self.storage_file, f"{self.storage_file}.prev")
             os.replace(temporary_file, self.storage_file)
         except (OSError, TypeError, ValueError) as error:
-            self.log(f"COP-data kon niet worden opgeslagen: {error}", level="WARNING")
+            self.error(f"COP-data kon niet worden opgeslagen: {error}")
             try:
                 os.remove(temporary_file)
             except OSError:
@@ -1396,6 +1396,10 @@ class COPCalculator(hass.Hass):
     # Sensoren publiceren
     # ------------------------------------------------------------------
     def _set_sensor(self, entity_id, state, attributes):
+        # Altijd als tekst doorgeven: AppDaemon laat een 'falsy' status zoals 0.0 weg, waarna
+        # Home Assistant de update met HTTP 400 weigert (zo bleven alle kWh-sensoren op 0 leeg).
+        if isinstance(state, (int, float)) and not isinstance(state, bool):
+            state = str(state + 0.0)  # '+ 0.0' maakt van -0.0 een gewone 0.0
         monotonic_now = time.monotonic()
         fingerprint = json.dumps([state, attributes], sort_keys=True, default=str)
         cached = self._published.get(entity_id)
