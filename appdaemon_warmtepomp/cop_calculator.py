@@ -155,7 +155,7 @@ class COPCalculator(hass.Hass):
         if isinstance(custom_entities, dict):
             for old_key, new_key in legacy_keys.items():
                 if custom_entities.get(old_key):
-                    self.warning(f"entities.{old_key} is vervangen door entities.{new_key}; waarde overgenomen.")
+                    self.log(f"entities.{old_key} is vervangen door entities.{new_key}; waarde overgenomen.", level="WARNING")
                     self.entities[new_key] = custom_entities[old_key]
 
         self.update_interval = max(5, self._arg("update_interval", 30, int))
@@ -176,11 +176,11 @@ class COPCalculator(hass.Hass):
         self.builtin_delta_t_offset = self._arg("builtin_delta_t_offset", 0.0, float)
         self.temperature_source = str(self.args.get("temperature_source", "auto")).strip().lower()
         if self.temperature_source not in ("own", "builtin", "auto"):
-            self.warning(f"Onbekende temperature_source '{self.temperature_source}', 'auto' gebruikt.")
+            self.log(f"Onbekende temperature_source '{self.temperature_source}', 'auto' gebruikt.", level="WARNING")
             self.temperature_source = "auto"
         self.dhw_temperature_source = str(self.args.get("dhw_temperature_source", "builtin")).strip().lower()
         if self.dhw_temperature_source not in ("own", "builtin", "auto"):
-            self.warning(f"Onbekende dhw_temperature_source '{self.dhw_temperature_source}', 'builtin' gebruikt.")
+            self.log(f"Onbekende dhw_temperature_source '{self.dhw_temperature_source}', 'builtin' gebruikt.", level="WARNING")
             self.dhw_temperature_source = "builtin"
         self.own_max_deviation = max(0.0, self._arg("own_max_deviation", 5.0, float))
         self.source_switch_seconds = max(0.0, self._arg("source_switch_seconds", 120, float))
@@ -189,7 +189,7 @@ class COPCalculator(hass.Hass):
         self.thermal_tail_seconds = max(0.0, self._arg("thermal_tail_seconds", 300, float))
         self.dhw_thermal_method = str(self.args.get("dhw_thermal_method", "tank")).strip().lower()
         if self.dhw_thermal_method not in ("tank", "flow"):
-            self.warning(f"Onbekende dhw_thermal_method '{self.dhw_thermal_method}', 'tank' gebruikt.")
+            self.log(f"Onbekende dhw_thermal_method '{self.dhw_thermal_method}', 'tank' gebruikt.", level="WARNING")
             self.dhw_thermal_method = "tank"
         self.calibration_max_outdoor_power = self._arg("calibration_max_outdoor_power", 30, float)
         self.backup_keep_days = max(1, self._arg("backup_keep_days", 30, int))
@@ -278,7 +278,7 @@ class COPCalculator(hass.Hass):
         try:
             return cast(value)
         except (TypeError, ValueError):
-            self.warning(f"Ongeldige waarde voor '{name}': {value!r}. Standaardwaarde {default!r} gebruikt.")
+            self.log(f"Ongeldige waarde voor '{name}': {value!r}. Standaardwaarde {default!r} gebruikt.", level="WARNING")
             return cast(default)
 
     def _now(self):
@@ -431,14 +431,14 @@ class COPCalculator(hass.Hass):
             with open(path, "r", encoding="utf-8") as data_file:
                 content = json.load(data_file)
         except (OSError, ValueError) as error:
-            self.warning(f"Kon {path} niet lezen: {error}")
+            self.log(f"Kon {path} niet lezen: {error}", level="WARNING")
             return None
         if isinstance(content, dict) and isinstance(content.get("data"), dict) and "key" in content:
             content = content["data"]  # HA .storage-bestand van de oude integratie
         if not isinstance(content, dict):
             return None
         if not any(key in content for key in ("lifetime", "monthly", "yearly", "daily", "calendar")):
-            self.warning(f"{path} lijkt geen COP-data te bevatten.")
+            self.log(f"{path} lijkt geen COP-data te bevatten.", level="WARNING")
             return None
         return content
 
@@ -462,9 +462,9 @@ class COPCalculator(hass.Hass):
         target = f"{path}.corrupt-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
         try:
             os.replace(path, target)
-            self.error(f"Corrupt bestand bewaard als {target}")
+            self.log(f"Corrupt bestand bewaard als {target}", level="WARNING")
         except OSError as error:
-            self.error(f"Kon corrupt bestand {path} niet hernoemen: {error}")
+            self.log(f"Kon corrupt bestand {path} niet hernoemen: {error}", level="WARNING")
 
     def _load_data(self):
         """Laad de data. Geeft het label van de bron terug, of None bij een schone start."""
@@ -521,7 +521,7 @@ class COPCalculator(hass.Hass):
             self._dirty = True
             self.log(f"{count} tellers overgenomen uit import_totals. Verwijder die optie na deze start.")
         else:
-            self.warning("import_totals bevat geen bruikbare waarden (verwacht <periode>: <modus>: electrical/thermal).")
+            self.log("import_totals bevat geen bruikbare waarden (verwacht <periode>: <modus>: electrical/thermal).", level="WARNING")
 
     def _check_storage_writable(self):
         try:
@@ -534,7 +534,7 @@ class COPCalculator(hass.Hass):
             self._notify(f"COP Calculator kan niet schrijven naar {self.data_dir}: {error}")
 
     def _notify(self, message):
-        self.error(message)
+        self.log(message, level="WARNING")
         try:
             self.call_service(
                 "persistent_notification/create",
@@ -543,7 +543,7 @@ class COPCalculator(hass.Hass):
                 notification_id="cop_calculator_storage",
             )
         except Exception as error:  # noqa: BLE001
-            self.warning(f"Melding in Home Assistant mislukt: {error}")
+            self.log(f"Melding in Home Assistant mislukt: {error}", level="WARNING")
 
     # ------------------------------------------------------------------
     # Persistentie: opslaan en back-ups
@@ -563,7 +563,7 @@ class COPCalculator(hass.Hass):
                 shutil.copy2(self.storage_file, f"{self.storage_file}.prev")
             os.replace(temporary_file, self.storage_file)
         except (OSError, TypeError, ValueError) as error:
-            self.error(f"COP-data kon niet worden opgeslagen: {error}")
+            self.log(f"COP-data kon niet worden opgeslagen: {error}", level="WARNING")
             try:
                 os.remove(temporary_file)
             except OSError:
@@ -624,14 +624,15 @@ class COPCalculator(hass.Hass):
                     if os.path.exists(path):
                         existing = self._read_json(path)
                         if existing is not None and self._lifetime_total(existing) > current_total + 1e-9:
-                            self.warning(
-                                f"Back-up {path} niet overschreven: bevat meer verbruik dan de huidige data."
+                            self.log(
+                                f"Back-up {path} niet overschreven: bevat meer verbruik dan de huidige data.",
+                                level="WARNING"
                             )
                             continue
                     self._copy_atomic(self.storage_file, path)
                 self._prune_backups(directory, now)
             except OSError as error:
-                self.warning(f"Back-up naar {directory} mislukt: {error}")
+                self.log(f"Back-up naar {directory} mislukt: {error}", level="WARNING")
         self._last_backup_iso = now.isoformat()
 
     def _prune_backups(self, directory, now):
@@ -828,7 +829,7 @@ class COPCalculator(hass.Hass):
         now = time.monotonic()
         if now - self._warned.get(key, -1e9) > 6 * 3600:
             self._warned[key] = now
-            self.warning(message)
+            self.log(message, level="WARNING")
 
     def _apply_electrical(self, energies):
         for category, kwh in energies.items():
@@ -939,7 +940,7 @@ class COPCalculator(hass.Hass):
         try:
             return sorted((float(temp), float(offset)) for temp, offset in raw)
         except (TypeError, ValueError):
-            self.warning("Ongeldige delta_t_offset_curve (verwacht [[temperatuur, offset], ...]); genegeerd.")
+            self.log("Ongeldige delta_t_offset_curve (verwacht [[temperatuur, offset], ...]); genegeerd.", level="WARNING")
             return []
 
     def _delta_t_offset_at(self, inlet_temp):
@@ -1127,7 +1128,7 @@ class COPCalculator(hass.Hass):
             raw_elapsed = monotonic_now - self._last_update_monotonic
             self._last_update_monotonic = monotonic_now
             if raw_elapsed > self.max_gap_seconds:
-                self.warning(
+                self.log(
                     f"Update-gap van {raw_elapsed:.0f}s (AppDaemon geblokkeerd?). "
                     "Deze periode wordt niet meegeteld."
                 )
