@@ -118,8 +118,18 @@ class WoningThermischeAnalyse(hass.Hass):
         "opwarm": ("sensor.huis_opwarm_constante", "input_number.huis_opwarm_constante_helper"),
         "interne_winst": ("sensor.huis_interne_winst", "input_number.huis_interne_winst_helper"),
         "verwarming_gain": ("sensor.huis_verwarming_gain", "input_number.huis_verwarming_gain_helper"),
+        "cop": ("sensor.huis_wp_cop", "input_number.huis_wp_cop_helper"),
     }
     KWALITEIT_SENSOR = "sensor.huis_model_kwaliteit"
+    STANDAARD_BUITEN = ["sensor.woonkamer_buiten2_temperatuur", "sensor.kantoor_buiten_temperatuur",
+                        "sensor.sonoff_tuin_temperature"]
+    # COP-relatie (thermisch / elektrisch per kwartier, alleen ruimteverwarming)
+    COP_HEAT_MIN_AANDEEL = 0.9      # kwartier (vrijwel) volledig 'heat_thermo_on'
+    COP_MIN_Q_KW, COP_MIN_P_KW = 0.5, 0.3
+    COP_BEREIK = (1.0, 8.0)
+    COP_MIN_RIJEN = 30
+    COP_MIN_SPREAD_K = 3.0          # p95-p5 van de buitentemperatuur om een helling te schatten
+    COP_MAX_HELLING = 4.0           # COP-stijging per 10 K, fysisch plausibel bereik 0..4
 
     KWARTIER_S = 900
     KWARTIER_H = 0.25
@@ -177,6 +187,15 @@ class WoningThermischeAnalyse(hass.Hass):
         if isinstance(eigen, dict):
             self.ent.update({k: v for k, v in eigen.items() if k in self.ent and v})
         self.tz = ZoneInfo(str(self.args.get("tijdzone", "Europe/Amsterdam")))
+        buiten = self.args.get("buiten_sensoren")
+        if buiten is None and isinstance(self.args.get("entities"), dict) and self.args["entities"].get("buiten"):
+            buiten = [self.args["entities"]["buiten"]]          # oude apps.yaml met één sensor
+        if isinstance(buiten, str):
+            buiten = [buiten]
+        self.buiten_entities = [str(b) for b in (buiten or self.STANDAARD_BUITEN)]
+        self.ent["buiten"] = self.buiten_entities[0]
+        self.buiten_min_sensoren = 2 if len(self.buiten_entities) >= 2 else 1
+        self._buiten_actief = list(self.buiten_entities)
         self.korte_dagen = max(3, self._arg("korte_dagen", 14, int))          # 5-min statistics/history
         self.lange_dagen = max(30, self._arg("lange_dagen", 365, int))         # uurlijkse long-term stats
         self.lang_refresh_dagen = self._arg("lang_refresh_dagen", 7, int)
@@ -351,6 +370,10 @@ class WoningThermischeAnalyse(hass.Hass):
             "tout_helling_per_10k": round(c.get("g_t", 0.0), 5), "ref_buiten": self.REF_TOUT,
             "tau_traag_uur": meta.get("tau_traag_uur"),
             "warmtecapaciteit_kwh_per_k": meta.get("c_kwh_k"), "ua_w_per_k": meta.get("ua_w_k"),
+            # nodig voor emsverwarming.py: vermogen waarmee g (K/h per kW) is bepaald, en wanneer de
+            # parameters voor het laatst een geaccepteerde fit waren (laatste_update is de laatste run)
+            "typisch_vermogen_kw": meta.get("p_typ"),
+            "laatste_geaccepteerd": meta.get("geaccepteerd_op"),
         }
         uitvoer = [
             ("afkoel", c.get("a"), {
@@ -368,6 +391,18 @@ class WoningThermischeAnalyse(hass.Hass):
                 "nacht": round(c.get("e0", 0.0), 5), "dag_extra_07_23": round(c.get("e1", 0.0), 5)}),
             ("verwarming_gain", g0 if "g_snel" in c else None, gain_attr),
         ]
+        cop = opslag.get("cop") or {}
+        if cop.get("cop_ref") is not None:
+            uitvoer.append(("cop", cop["cop_ref"], {
+                "unit_of_measurement": "COP", "friendly_name": "WP COP bij referentiebuitentemperatuur",
+                "ref_buiten": round(cop.get("ref_buiten", self.REF_TOUT), 1),
+                "cop_helling_per_10k": cop.get("cop_helling") and round(cop["cop_helling"], 3),
+                "p_el_ref_kw": cop.get("p_el_ref") and round(cop["p_el_ref"], 3),
+                "p_el_helling_per_10k_kw": cop.get("p_el_helling") and round(cop["p_el_helling"], 3),
+                "p_th_typ_kw": cop.get("p_th_typ") and round(cop["p_th_typ"], 3),
+                "datapunten_cop": cop.get("n"), "tout_bereik": [round(cop.get("tout_p5", 0), 1),
+                                                                round(cop.get("tout_p95", 0), 1)],
+                "bijgewerkt": cop.get("bijgewerkt")}))
         for sleutel, waarde, extra in uitvoer:
             if waarde is not None:
                 self._publiceer_waarde(sleutel, float(waarde), {**basis, **extra})
@@ -488,6 +523,8 @@ class WoningThermischeAnalyse(hass.Hass):
     def _haal_reeks(self, sleutel: str, start, einde, idx0: int, n: int, period: str,
                     stap_s: int, min_n: int, chunk_dagen: int, verplicht: bool = True) -> list:
         """Statistics -> raster, met eenheidscontrole en plausibiliteitsfilter."""
+        if sleutel == "buiten":
+            return self._haal_buiten(start, einde, idx0, n, period, stap_s, min_n, chunk_dagen, verplicht)
         entity = self.ent[sleutel]
         ruw = self._haal_stats(entity, start, einde, period, chunk_dagen)
         reeks = self._naar_grid(ruw, stap_s, idx0, n, min_n)
@@ -503,6 +540,30 @@ class WoningThermischeAnalyse(hass.Hass):
                 f"state_class (measurement) en staat hij niet in de recorder-exclude?")
         return reeks
 
+    def _haal_buiten(self, start, einde, idx0, n, period, stap_s, min_n, chunk_dagen, verplicht=True) -> list:
+        """Buitentemperatuur = mediaan van de beschikbare buitensensoren per tijdstap (minimaal
+        `buiten_min_sensoren`). De mediaan dempt zon-opwarming van één sensor. Gebruik dezelfde
+        definitie in het EMS, anders klopt de koppeling met de voorspelling niet."""
+        reeksen = []
+        for entity in self._buiten_actief:
+            ruw = self._haal_stats(entity, start, einde, period, chunk_dagen)
+            reeks = self._filter_bereik("buiten", self._naar_grid(ruw, stap_s, idx0, n, min_n))
+            beschikbaar = sum(v is not None for v in reeks)
+            self.log(f"Buitensensor {entity}: {100.0 * beschikbaar / max(1, n):.0f}% beschikbaar ({period}).")
+            reeksen.append(reeks)
+        uit = []
+        for i in range(n):
+            waarden = sorted(r[i] for r in reeksen if r[i] is not None)
+            if len(waarden) < self.buiten_min_sensoren:
+                uit.append(None)
+            elif len(waarden) % 2:
+                uit.append(waarden[len(waarden) // 2])
+            else:
+                uit.append(0.5 * (waarden[len(waarden) // 2 - 1] + waarden[len(waarden) // 2]))
+        if verplicht and not any(v is not None for v in uit):
+            raise ValueError("Geen bruikbare buitentemperatuur: controleer buiten_sensoren en state_class.")
+        return uit
+
     def _controleer_entiteiten(self) -> None:
         """Pre-flight: bestaan alle sensoren? Thermische sensor ontbreekt -> terug naar elektrisch."""
         self.thermisch = self.thermisch_geconfigureerd
@@ -510,7 +571,13 @@ class WoningThermischeAnalyse(hass.Hass):
             self.log(f"{self.ent['wp_thermisch_vermogen']} bestaat niet; analyse gebruikt "
                      f"elektrisch vermogen.", level="WARNING")
             self.thermisch = False
-        vereist = ["binnen", "buiten", "pv", "wind", "wp_status"]
+        self._buiten_actief = [e for e in self.buiten_entities if self.entity_exists(e)]
+        for e in self.buiten_entities:
+            if e not in self._buiten_actief:
+                self.log(f"Buitensensor {e} bestaat niet en wordt overgeslagen.", level="WARNING")
+        if len(self._buiten_actief) < self.buiten_min_sensoren:
+            raise RuntimeError("Te weinig bestaande buitensensoren: " + ", ".join(self.buiten_entities))
+        vereist = ["binnen", "pv", "wind", "wp_status"]
         if not self.thermisch:
             vereist += ["wp_binnen_vermogen", "wp_buiten_vermogen"]
         ontbrekend = [self.ent[k] for k in vereist if not self.entity_exists(self.ent[k])]
@@ -601,6 +668,13 @@ class WoningThermischeAnalyse(hass.Hass):
                 self.thermisch = False
             else:
                 serie["pt"] = th
+                try:   # elektrisch vermogen voor de COP-relatie (thermisch / elektrisch)
+                    pb = haal("wp_binnen_vermogen")
+                    pu = haal("wp_buiten_vermogen")
+                    serie["pe"] = [(a + b) if a is not None and b is not None else None for a, b in zip(pb, pu)]
+                except Exception as err:  # noqa: BLE001
+                    self.log(f"Elektrisch vermogen niet beschikbaar; COP-relatie overgeslagen: {err!r}",
+                             level="WARNING")
         if not self.thermisch:
             serie["wp_binnen_vermogen"] = haal("wp_binnen_vermogen")
             serie["wp_buiten_vermogen"] = haal("wp_buiten_vermogen")
@@ -757,6 +831,54 @@ class WoningThermischeAnalyse(hass.Hass):
         return res
 
     # ---------------------------------------------------------------- rijen kort model
+    def _lineair(self, xs, ys, ws, spread_ok):
+        """Gewogen rechte lijn y = c0 + c1*x; zonder voldoende spreiding alleen een constante."""
+        if spread_ok:
+            coef, _ = self._wls([[1.0, x] for x in xs], ys, ws)
+            if coef is not None:
+                return coef[0], coef[1]
+        sw = sum(ws)
+        return sum(w * y for w, y in zip(ws, ys)) / sw, None
+
+    def _cop_fit(self, s: dict):
+        """COP(Tout) en elektrisch/thermisch vermogen tijdens ruimteverwarming uit de kwartierdata."""
+        if not self.thermisch or not s.get("pe"):
+            return None
+        xs, cops, pes, qs, touts = [], [], [], [], []
+        for i in range(s["n"]):
+            q, p, tout, h, x = s["pt"][i], s["pe"][i], s["buiten"][i], s["heat"][i], s["excl"][i]
+            if None in (q, p, tout, h, x) or h < self.COP_HEAT_MIN_AANDEEL or x > self.excl_drempel:
+                continue
+            if q < self.COP_MIN_Q_KW or p < self.COP_MIN_P_KW:
+                continue
+            cop = q / p
+            if not (self.COP_BEREIK[0] <= cop <= self.COP_BEREIK[1]):
+                continue
+            xs.append((tout - self.REF_TOUT) / 10.0)
+            cops.append(cop); pes.append(p); qs.append(q); touts.append(tout)
+        if len(cops) < self.COP_MIN_RIJEN:
+            return {"reden": f"te weinig stookkwartieren voor COP ({len(cops)} < {self.COP_MIN_RIJEN})"}
+        tt = sorted(touts)
+        p5, p95 = tt[int(0.05 * len(tt))], tt[max(0, int(0.95 * len(tt)) - 1)]
+        spread_ok = (p95 - p5) >= self.COP_MIN_SPREAD_K
+        ws = list(pes)                                  # energiegewogen: grote vermogens tellen zwaarder
+        c0, c1 = self._lineair(xs, cops, ws, spread_ok)
+        if c1 is not None and not (0.0 <= c1 <= self.COP_MAX_HELLING):
+            c0, c1 = self._lineair(xs, cops, ws, False)  # onplausibele helling: alleen constante
+        p0, p1 = self._lineair(xs, pes, [1.0] * len(pes), spread_ok)
+        tgem = sum(touts) / len(touts)
+        if c1 is None:
+            # constante: COP geldt bij de gemiddelde buitentemperatuur van de data
+            ref_buiten, cop_ref = tgem, c0
+        else:
+            ref_buiten, cop_ref = self.REF_TOUT, c0
+        qs_sorted = sorted(qs)
+        return {
+            "cop_ref": cop_ref, "cop_helling": c1, "ref_buiten": ref_buiten,
+            "p_el_ref": p0, "p_el_helling": p1, "p_th_typ": qs_sorted[len(qs_sorted) // 2],
+            "n": len(cops), "tout_p5": p5, "tout_p95": p95,
+        }
+
     def _a_uit_helper(self):
         """Eerder bekende 'a' uit een helper (standaard die van het oorspronkelijke script) als voorlopige waarde."""
         ent = self.a_prior_entity
@@ -895,6 +1017,12 @@ class WoningThermischeAnalyse(hass.Hass):
         start = einde - datetime.timedelta(days=self.korte_dagen)
         s = serie if serie is not None else self._bouw_serie(start, einde)
         self._serie_cache = s   # hergebruikt bij een tweede poging met vaste a
+        if serie is None:
+            try:
+                self._cop_resultaat = self._cop_fit(s)
+            except Exception as err:  # noqa: BLE001
+                self.log(f"COP-berekening mislukt: {err!r}", level="WARNING")
+                self._cop_resultaat = None
         uitsluiten = ("g_t",) if self.thermisch else ()
         heeft_holdout = s["n"] > self.HOLDOUT_MIN_DAGEN * 96
         cut = s["n"] - int(self.holdout_dagen * 96) if heeft_holdout else 0
@@ -1227,6 +1355,20 @@ class WoningThermischeAnalyse(hass.Hass):
             bron = "lang"
             n = lang_fit["n"] if lang_fit is not None else (lang_info or {}).get("n", 0)
 
+        cop_nieuw = getattr(self, "_cop_resultaat", None)
+        cop_oud = nieuw_opslag.get("cop") or {}
+        if cop_nieuw and "cop_ref" in cop_nieuw:
+            samen = {}
+            for k in ("cop_ref", "cop_helling", "p_el_ref", "p_el_helling", "p_th_typ"):
+                nw, od = cop_nieuw.get(k), cop_oud.get(k)
+                samen[k] = nw if (od is None or nw is None or cop_oud.get("ref_buiten") != cop_nieuw["ref_buiten"]) \
+                    else od + self.smoothing * (nw - od)
+            samen.update({k: cop_nieuw[k] for k in ("ref_buiten", "n", "tout_p5", "tout_p95")})
+            samen["bijgewerkt"] = nu.isoformat()
+            nieuw_opslag["cop"] = samen
+            kw["cop_status"] = "ok"
+        else:
+            kw["cop_status"] = (cop_nieuw or {}).get("reden", "niet berekend")
         kw["laatste_run"] = nu.isoformat()
         kw["lang"] = lang_info
         nieuw_opslag["kwaliteit"] = kw
@@ -1253,7 +1395,7 @@ class WoningThermischeAnalyse(hass.Hass):
                 tau_traag = oud_meta.get("tau_traag_uur", self.tau_traag_h)
             else:
                 tau_traag = kort["tau"]
-            meta = {"bron": bron, "n": n, "tau_traag_uur": tau_traag,
+            meta = {"bron": bron, "n": n, "tau_traag_uur": tau_traag, "geaccepteerd_op": nu.isoformat(),
                     "invoer": invoer, "modus": "passief" if passief else "volledig",
                     "p_typ": round(p_typ, 3) if p_typ else None,
                     "opwarm": round(g0 * p_typ, 4) if (g0 and p_typ) else oud_meta.get("opwarm")}
