@@ -3,7 +3,7 @@
 Rolverdeling
 ------------
 * Generic thermostat (climate.warmtepomp_regeling): doeltemperatuur, hvac-modus en comfortvraag.
-  Zijn actuator is input_boolean.verwarming_vrijgave ("comfort vraagt verwarming").
+  Zijn actuator is switch.verwarming_vrijgave ("comfort vraagt verwarming").
 * Dit script: beslist elk kwartier (en direct bij een wijziging van de thermostaat) of
   switch.warmtepomp_status_dummy aan of uit moet. Dat is de enige schakelaar die jouw bestaande
   automatisering "Warmtepomp stooklijn schrijven" gebruikt voor Modbus (registers 1002/1005).
