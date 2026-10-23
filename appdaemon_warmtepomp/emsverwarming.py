@@ -107,7 +107,7 @@ class EMSVerwarming(hass.Hass):
     def _laad_config(self):
         a = self.args
         self.climate = a.get("climate", "climate.warmtepomp_regeling")
-        self.vrijgave = a.get("vrijgave_entity", "input_boolean.verwarming_vrijgave")
+        self.vrijgave = a.get("vrijgave_entity", "switch.verwarming_vrijgave")
         self.dummy = a.get("dummy_switch", "switch.warmtepomp_status_dummy")
         self.ems_actief_entity = a.get("ems_actief_entity", "input_boolean.ems_actief")
         self.cold_tol = max(0.0, self._arg("cold_tolerance", 0.4))      # gelijk aan generic thermostat
