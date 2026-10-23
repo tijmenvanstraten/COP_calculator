@@ -19,7 +19,11 @@ Beslisvolgorde
  5. anders: simulatie per kwartier met voorspelde buitentemperatuur, wind, PV, prijs en COP.
     - Elk kandidaat-startmoment moet de temperatuur boven doel - cold_tolerance houden.
     - Kies het goedkoopste kandidaat (totale kosten = prijs x elektrisch vermogen).
-    - Geen voorspelde warmtevraag: opportunistisch bufferen bij lage prijs of veel PV.
+    - Voorverwarmen (tot doel + buffer_marge) alleen als warmte nu, gecorrigeerd voor COP en opslagverlies,
+      goedkoper is dan het stookvenster dat anders nodig zou zijn (vooruitblik standaard 8 uur).
+    - Eigen PV: vanaf pv_eigenverbruik_vanaf (standaard 2027-01-01, einde saldering) kost een zelf
+      verbruikte kWh alleen de gemiste teruglevering (epex_prijs uit de forecast). Het PV-overschot is
+      pv_kw - verbruik_kw uit dezelfde forecast. Alle prijzen en vermogens komen uit sensor.energie_core_forecast.
 """
 
 import datetime
@@ -49,16 +53,18 @@ class EMSVerwarming(hass.Hass):
     FALLBACK_K_OPWARM = 0.45        # K/h bruto, alleen voor het eenvoudige noodmodel
     FALLBACK_DEFAULT_COP = 3.0
 
-    BUFFER_PRICE_THRESHOLD_EUR = 0.14
     PRICE_WINDOW_TOLERANCE_EUR = 0.005
     PRICE_HYSTERESIS_EUR = 0.005
-    PV_BUFFER_POWER_W = 1500
-    BUFFER_TEMPERATURE_MARGIN_C = 0.5
+    BUFFER_TEMPERATURE_MARGIN_C = 0.5   # voorverwarmen tot maximaal doel + deze marge
+    PREHEAT_LOOKAHEAD_QUARTERS = 32     # 8 uur vooruitkijken naar de volgende warmtevraag
+    PREHEAT_MARGIN_EUR_KWH_TH = 0.01    # minimaal voordeel per kWh warmte om voor te verwarmen
     MIN_START_DEFICIT_C = 0.2       # EMS start pas als de temperatuur minstens zoveel onder het doel zit
     OVERSHOOT_HARD_C = 1.0
     MAX_INDOOR_C = 21.5
 
     FORECAST_VALUE_KEYS = ("pv_kw", "net_prijs")
+    FORECAST_OPTIONAL_KEYS = ("epex_prijs", "verbruik_kw")      # teruglever-prijs en verwacht huisverbruik
+    FORECAST_MAX_AGE_MIN = 360
     WP_STATUS_AAN = "operation_state_heat_thermo_on"
     OUTDOOR_RANGE = (-30.0, 45.0)
     WIND_UNIT_TO_KMH = {"km/h": 1.0, "m/s": 3.6, "mph": 1.609344, "kn": 1.852, "ft/s": 1.09728}
@@ -127,9 +133,31 @@ class EMSVerwarming(hass.Hass):
         self.max_indoor = self._arg("max_binnentemperatuur", self.MAX_INDOOR_C)
         self.overshoot_hard = self._arg("max_overschrijding", self.OVERSHOOT_HARD_C)
         self.min_switch_s = self._arg("minimale_wisseltijd_seconden", self.MINIMALE_WISSELTIJD_SECONDEN, float)
-        self.buffer_price = self._arg("buffer_prijsgrens", self.BUFFER_PRICE_THRESHOLD_EUR)
-        self.pv_buffer_w = self._arg("pv_buffer_vermogen_w", self.PV_BUFFER_POWER_W)
-        self.buffer_margin = self._arg("buffer_marge", self.BUFFER_TEMPERATURE_MARGIN_C)
+        self.buffer_margin = max(0.0, self._arg("buffer_marge", self.BUFFER_TEMPERATURE_MARGIN_C))
+        self.preheat_lookahead = max(self.horizon, self._arg("voorverwarmen_vooruitblik_kwartieren",
+                                                             self.PREHEAT_LOOKAHEAD_QUARTERS, int))
+        self.preheat_margin = self._arg("voorverwarmen_marge_eur_kwh_th", self.PREHEAT_MARGIN_EUR_KWH_TH)
+        pv_waarde = a.get("pv_eigenverbruik_waarde")           # noodoptie: vaste waarde per kWh eigen PV
+        try:
+            self.pv_value = float(pv_waarde) if pv_waarde is not None else None
+        except (TypeError, ValueError):
+            self.pv_value = None
+        verschil = a.get("pv_teruglever_verschil")              # noodoptie: afname minus teruglevering
+        try:
+            self.pv_delta = float(verschil) if verschil is not None else None
+        except (TypeError, ValueError):
+            self.pv_delta = None
+        self.pv_export_correction = self._arg("pv_teruglever_correctie", 0.0)   # optelling op epex_prijs
+        self.pv_aware = bool(a.get("pv_eigenverbruik", True))
+        self.pv_delta_from = None
+        vanaf = a.get("pv_eigenverbruik_vanaf", a.get("pv_teruglever_verschil_vanaf", "2027-01-01"))
+        if vanaf:
+            try:
+                self.pv_delta_from = datetime.date.fromisoformat(str(vanaf))
+            except ValueError:
+                self.log(f"pv_eigenverbruik_vanaf={vanaf!r} is geen geldige datum (JJJJ-MM-DD).", level="WARNING")
+        self.pv_base_kw = max(0.0, self._arg("pv_basislast_kw", 0.3))   # PV die het huis zelf al verbruikt
+        self.pv_floor = self._arg("pv_waarde_ondergrens", 0.0)          # onderste waarde per kWh eigen PV
         self.default_cop = self._arg("standaard_cop", self.FALLBACK_DEFAULT_COP)
 
     # ------------------------------------------------------------------ hulpfuncties
@@ -273,6 +301,12 @@ class EMSVerwarming(hass.Hass):
                     continue
             except (KeyError, TypeError, ValueError, OverflowError):
                 continue
+            for key in self.FORECAST_OPTIONAL_KEYS:
+                try:
+                    v = float(row[key])
+                    values[key] = v if math.isfinite(v) else None
+                except (KeyError, TypeError, ValueError):
+                    values[key] = None
             rows.append({"tijd": start, **values})
         return rows
 
@@ -282,14 +316,20 @@ class EMSVerwarming(hass.Hass):
         q0 = int(nu.timestamp() // self.QUARTER_S)
         known = [(k, r["net_prijs"]) for k, r in by_q.items() if k <= q0]
         last_price = max(known)[1] if known else average_price
-        prices, pv = [], []
+        known_epex = [(k, r["epex_prijs"]) for k, r in by_q.items() if k <= q0 and r.get("epex_prijs") is not None]
+        last_epex = max(known_epex)[1] if known_epex else None
+        prices, pv, epex, load = [], [], [], []
         for i in range(n):
             row = by_q.get(q0 + i)
             if row is not None:
                 last_price = row["net_prijs"]
+                if row.get("epex_prijs") is not None:
+                    last_epex = row["epex_prijs"]
             prices.append(last_price)
             pv.append(row["pv_kw"] if row is not None else 0.0)
-        return prices, pv
+            epex.append(last_epex)
+            load.append(row.get("verbruik_kw") if row is not None else None)
+        return prices, pv, epex, load
 
     # ------------------------------------------------------------------ buitentemperatuur / wind
     def _outdoor_now(self):
@@ -565,9 +605,10 @@ class EMSVerwarming(hass.Hass):
         return indoor + rate * self.QUARTER_H, next_ema
 
     # ------------------------------------------------------------------ vensters plannen
-    def _plan(self, model, cop, nu, indoor, temps, winds, pv, prices, target, floor, goal, heating_on, ema0):
+    def _plan(self, model, cop, nu, indoor, temps, winds, pv, prices, target, floor, goal, heating_on, ema0,
+              horizon=None):
         """Passieve baan + kandidaat-startmomenten met comforteis en totale kosten."""
-        horizon = self.horizon
+        horizon = horizon or self.horizon
         n = len(temps)
         times = [nu + datetime.timedelta(minutes=15 * q) for q in range(n)]
         heat = [self._heat_params(model, cop, temps[q]) for q in range(n)]
@@ -589,24 +630,59 @@ class EMSVerwarming(hass.Hass):
             if t_s > goal - self.start_deficit and not continuing:
                 continue
             temp, ema, dur, tmin = t_s, e_s, 0, t_s
-            cost = energy = 0.0
+            cost = energy = th_energy = 0.0
             while (temp < goal or dur == 0) and dur < self.MAX_MODEL_HEATING_QUARTERS and s + dur < n:
                 q = s + dur
-                p_in, p_el, _ = heat[q]
+                p_in, p_el, c_q = heat[q]
                 temp, ema = self._simulate_step(model, temp, ema, temps[q], winds[q], pv[q], p_in, times[q])
                 tmin = min(tmin, temp)
                 cost += prices[q] * p_el * self.QUARTER_H
                 energy += p_el * self.QUARTER_H
+                th_energy += p_el * c_q * self.QUARTER_H
                 dur += 1
             if temp < goal:
                 continue
             if min(min_pref[s], tmin) < floor:
                 continue
-            candidates.append({"start_q": s, "duration": dur, "cost": cost, "energy": energy,
+            candidates.append({"start_q": s, "duration": dur, "cost": cost, "energy": energy, "th_energy": th_energy,
                                "avg_price": cost / energy if energy > 0 else prices[s],
                                "min_temp": min(min_pref[s], tmin)})
         return {"passive": passive, "need_q": need_q, "candidates": candidates,
                 "minimum_temp": min(p[0] for p in passive), "heat": heat}
+
+    def _voorverwarmen(self, model, cop, nu, indoor, temps, winds, pv, prices, target, floor, goal,
+                       heating_on, ema0, diag):
+        """Voorverwarmen boven het doel als warmte nu goedkoper is dan het stookvenster dat anders nodig is.
+
+        Vergelijkt prijs per kWh WARMTE: nu (prijs / COP, gecorrigeerd voor het opslagverlies tot het
+        moment van gebruik) tegen het goedkoopste geldige venster binnen de vooruitblik.
+        Geeft True als nu verwarmd moet worden om op te slaan."""
+        cap = target + self.buffer_margin
+        if not (indoor <= cap - self.start_deficit or (heating_on and indoor < cap)):
+            diag["preheat"] = "geen ruimte onder doel + buffer_marge"
+            return False
+        look = self.preheat_lookahead
+        plan = self._plan(model, cop, nu, indoor, temps, winds, pv, prices, target, floor, goal,
+                          False, ema0, horizon=look)
+        if plan["need_q"] is None:
+            diag["preheat"] = f"geen warmtevraag binnen {look * 15 // 60} uur"
+            return False
+        kandidaten = [c for c in plan["candidates"] if c["th_energy"] > 0]
+        if not kandidaten:
+            diag["preheat"] = "geen geldig referentievenster"
+            return False
+        ref = min(kandidaten, key=lambda c: c["cost"] / c["th_energy"])
+        ref_per_th = ref["cost"] / ref["th_energy"]
+        uren_tot_gebruik = max(0.25, ref["start_q"] * self.QUARTER_H)
+        behoud = math.exp(-model["a"] * uren_tot_gebruik)          # aandeel opgeslagen warmte dat overblijft
+        cop_nu = plan["heat"][0][2]
+        nu_per_th = prices[0] / cop_nu / behoud
+        diag.update({"preheat_ref_eur_per_kwh_th": round(ref_per_th, 4),
+                     "preheat_now_eur_per_kwh_th": round(nu_per_th, 4),
+                     "preheat_hours_until_use": round(uren_tot_gebruik, 2)})
+        ja = nu_per_th <= ref_per_th - self.preheat_margin
+        diag["preheat"] = "ja" if ja else "nee: nu niet duidelijk goedkoper dan het stookvenster"
+        return ja
 
     # ------------------------------------------------------------------ hoofdbeslissing
     def _beslis(self):
@@ -671,13 +747,23 @@ class EMSVerwarming(hass.Hass):
                      "forecast_status": self.get_state(self.forecast_entity, attribute="status"),
                      "forecast_generated_at": self.get_state(self.forecast_entity, attribute="generated_at")})
         zon_nu = self._float(self.pv_entity) or 0.0
+        fa = self.get_state(self.forecast_entity, attribute="generated_at")
+        try:
+            age_min = (now - self._parse_dt(fa)).total_seconds() / 60.0
+            diag["forecast_age_min"] = round(age_min)
+            if age_min > self.FORECAST_MAX_AGE_MIN:
+                self._warn_once("fc_age", f"{self.forecast_entity} is {age_min / 60:.1f} uur oud; PV-voorspelling kan achterlopen.")
+        except (TypeError, ValueError, AttributeError):
+            pass
+        for key in ("prijs_dekking_tot", "pv_dekking_tot"):
+            diag[key] = self.get_state(self.forecast_entity, attribute=key)
         if not forecast:
             self._warn_once("forecast", f"{self.forecast_entity} bevat geen bruikbare forecast; geen prijsoptimalisatie.")
             self._apply(now, False, "basisregeling", "forecast ontbreekt; alleen thermostaat bepaalt", diag)
             return
         gem_prijs = sum(r["net_prijs"] for r in forecast) / len(forecast)
-        n = self.horizon + self.MAX_MODEL_HEATING_QUARTERS + 1
-        prices, pv = self._kwartier_reeksen(forecast, nu, n, gem_prijs)
+        n = max(self.horizon, self.preheat_lookahead) + self.MAX_MODEL_HEATING_QUARTERS + 1
+        prices, pv, epex, load = self._kwartier_reeksen(forecast, nu, n, gem_prijs)
         prijs_nu = prices[0]
         diag["current_net_price_eur_kwh"] = prijs_nu
 
@@ -706,6 +792,30 @@ class EMSVerwarming(hass.Hass):
             "current_pv_power_w": zon_nu,
         })
 
+        pv_actief = self.pv_aware and not (self.pv_delta_from is not None and now.date() < self.pv_delta_from)
+        heeft_epex = any(e is not None for e in epex)
+        if pv_actief and (heeft_epex or self.pv_delta is not None or self.pv_value is not None):
+            # Eigen PV (het deel boven het huisverbruik dat de WP dekt) kost alleen de gemiste teruglevering.
+            # Bron voor de waarde: epex_prijs (+correctie) uit de forecast; anders vast verschil; anders vaste waarde.
+            bron = "epex_prijs" if heeft_epex else ("verschil" if self.pv_delta is not None else "vast")
+            eff = []
+            for q in range(n):
+                p_el_q = max(0.3, self._heat_params(model, cop, temps[q])[1])
+                basis = load[q] if load[q] is not None else self.pv_base_kw
+                share = min(1.0, max(0.0, pv[q] - basis) / p_el_q)
+                if epex[q] is not None:
+                    waarde = epex[q] + self.pv_export_correction
+                elif self.pv_delta is not None:
+                    waarde = prices[q] - self.pv_delta
+                else:
+                    waarde = self.pv_value
+                waarde = min(prices[q], max(self.pv_floor, waarde))
+                eff.append(share * waarde + (1.0 - share) * prices[q])
+            prices = eff
+            diag.update({"pv_aware_prices": True, "pv_waarde_bron": bron,
+                         "effective_price_now_eur_kwh": round(prices[0], 4)})
+        else:
+            diag["pv_aware_prices"] = False
         heating_on = dummy_state == "on"
         ema0 = self._initial_ema(model, now) if model["simulation"] == "geleerd_rc" else 0.0
         diag["initial_ema_kw"] = round(ema0, 3)
@@ -729,8 +839,13 @@ class EMSVerwarming(hass.Hass):
                          "best_window_cost_eur": round(best["cost"], 4),
                          "best_window_avg_price_eur_kwh": round(best["avg_price"], 4)})
             if current is None:
-                self._apply(now, False, "wachten",
-                            f"verwarmen start liefst over {best['start_q'] * 15} min (goedkoopste venster)", diag)
+                if self._voorverwarmen(model, cop, nu, t_binnen, temps, winds, pv, prices, target, floor, goal,
+                                       heating_on, ema0, diag):
+                    self._apply(now, True, "aan_voorverwarmen",
+                                "nu goedkoper dan het komende stookvenster; warmte opslaan", diag)
+                else:
+                    self._apply(now, False, "wachten",
+                                f"verwarmen start liefst over {best['start_q'] * 15} min (goedkoopste venster)", diag)
                 return
             tol = self.PRICE_WINDOW_TOLERANCE_EUR + (self.PRICE_HYSTERESIS_EUR if heating_on else 0.0)
             diag["current_window_cost_eur"] = round(current["cost"], 4)
@@ -740,9 +855,9 @@ class EMSVerwarming(hass.Hass):
                 self._apply(now, False, "wachten", "later verwarmingsvenster is goedkoper", diag)
             return
 
-        # 8b. Geen voorspelde warmtevraag: opportunistisch bufferen
-        grens = self.buffer_price + (self.PRICE_HYSTERESIS_EUR if heating_on else 0.0)
-        if (prijs_nu < grens or zon_nu > self.pv_buffer_w) and t_binnen < target + self.buffer_margin:
-            self._apply(now, True, "aan_bufferen", "gunstige prijs of actueel PV-vermogen; ruimte voor bufferwarmte", diag)
+        # 8b. Geen warmtevraag binnen de horizon: voorverwarmen als er verderop wel vraag is en nu goedkoper is
+        if self._voorverwarmen(model, cop, nu, t_binnen, temps, winds, pv, prices, target, floor, goal,
+                               heating_on, ema0, diag):
+            self._apply(now, True, "aan_voorverwarmen", "nu goedkoper dan het komende stookvenster; warmte opslaan", diag)
         else:
-            self._apply(now, False, "uit", "geen voorspelde warmtevraag of gunstige bufferconditie", diag)
+            self._apply(now, False, "uit", f"geen warmtevraag binnen de horizon ({diag.get('preheat')})", diag)
