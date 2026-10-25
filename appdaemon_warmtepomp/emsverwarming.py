@@ -3,7 +3,7 @@
 Rolverdeling
 ------------
 * Generic thermostat (climate.warmtepomp_regeling): doeltemperatuur, hvac-modus en comfortvraag.
-  Zijn actuator is switch.verwarming_vrijgave ("comfort vraagt verwarming").
+  Zijn actuator is switch.verwarming_vrijgave (template switch; "comfort vraagt verwarming").
 * Dit script: beslist elk kwartier (en direct bij een wijziging van de thermostaat) of
   switch.warmtepomp_status_dummy aan of uit moet. Dat is de enige schakelaar die jouw bestaande
   automatisering "Warmtepomp stooklijn schrijven" gebruikt voor Modbus (registers 1002/1005).
@@ -75,6 +75,56 @@ class EMSVerwarming(hass.Hass):
     THERMAL_MODEL_GAIN_ENTITY = "sensor.huis_verwarming_gain"
     THERMAL_MODEL_INTERNAL_GAIN_ENTITY = "sensor.huis_interne_winst"
 
+    # ================================================================== INSTELLINGEN
+    # Alle instellingen staan hier. apps.yaml hoeft alleen module/class te bevatten; sleutels daar
+    # (met dezelfde naam) overschrijven deze waarden, maar dat is optioneel.
+    INSTELLINGEN = {
+        # --- Thermostaat, vrijgave en schakelaar
+        "climate": "climate.warmtepomp_regeling",
+        "vrijgave_entity": "switch.verwarming_vrijgave",          # actuator van de generic thermostat
+        "dummy_switch": "switch.warmtepomp_status_dummy",         # wat deze app schakelt
+        "ems_actief_entity": "input_boolean.ems_actief",          # uit = schaduwmodus (dummy volgt thermostaat)
+        "cold_tolerance": 0.4,                                    # gelijk aan de generic thermostat
+        "hot_tolerance": 0.0,                                     # gelijk aan de generic thermostat
+        # --- Sensoren
+        "binnen_sensor": "sensor.woonkamer_temperatuur_gemiddeld",
+        "buiten_sensoren": ["sensor.woonkamer_buiten2_temperatuur", "sensor.kantoor_buiten_temperatuur",
+                            "sensor.sonoff_tuin_temperature"],     # mediaan; gelijk aan de analyse
+        "wind_sensor": "sensor.thuis_windsnelheid",
+        "pv_sensor": "sensor.solaredge_i1_ac_power",
+        "wp_status_sensor": "sensor.control_unit_operation_state_2",
+        "thermisch_vermogen_sensor": "sensor.control_unit_thermal_power_heating",
+        "elektrisch_vermogen_sensoren": ["sensor.shelly_warmtepomp_binnenunit_active_power",
+                                         "sensor.shelly_warmtepomp_buitenunit_active_power"],
+        "forecast_entity": "sensor.energie_core_forecast",
+        # --- Weersvoorspelling
+        "weather_entities": ["weather.knmi_thuis", "weather.beerweer"],
+        "weather_cache_minuten": 30,
+        "weather_bias_tau_uur": 3.0,
+        # --- Planning en comfort
+        "horizon_kwartieren": 16,
+        "min_start_deficit": 0.2,
+        "max_binnentemperatuur": 21.5,
+        "max_overschrijding": 1.0,
+        "minimale_wisseltijd_seconden": 1200,
+        "standaard_cop": 3.0,                                     # alleen als sensor.huis_wp_cop ontbreekt
+        # --- Voorverwarmen
+        "buffer_marge": 0.5,
+        "voorverwarmen_vooruitblik_kwartieren": 32,
+        "voorverwarmen_marge_eur_kwh_th": 0.01,
+        # --- Eigen PV (prijzen en verbruik komen uit sensor.energie_core_forecast)
+        "pv_eigenverbruik": True,
+        "pv_eigenverbruik_vanaf": "2027-01-01",                   # ervoor geldt de afnameprijs (saldering)
+        "pv_teruglever_correctie": 0.0,
+        "pv_waarde_ondergrens": 0.0,
+        "pv_basislast_kw": 0.3,
+        "pv_teruglever_verschil": None,                           # noodopties als epex_prijs ontbreekt
+        "pv_eigenverbruik_waarde": None,
+    }
+    APPDAEMON_SLEUTELS = {"module", "class", "name", "priority", "dependencies", "global_dependencies", "log",
+                          "log_level", "disable", "plugin", "namespace", "config_dir", "app_dir", "pin_app",
+                          "pin_thread", "production_mode", "use_dictionary_unpacking", "logs", "app_name"}
+
     # ------------------------------------------------------------------ opstarten
     def initialize(self):
         self.log("--- EMS Verwarming v2 gestart (schakelt de dummy; thermostaat levert de vrijgave) ---")
@@ -82,6 +132,7 @@ class EMSVerwarming(hass.Hass):
         self._weather_cache = None
         self._last_outdoor = None
         self._last_command_ts = None
+        self._shadow = False
         self._warned = set()
         self._laad_config()
 
@@ -94,10 +145,12 @@ class EMSVerwarming(hass.Hass):
         volgende = nu.replace(minute=(nu.minute // 15) * 15, second=5, microsecond=0) \
             + datetime.timedelta(minutes=15)
         self.run_every(self._cyclus, volgende, self.QUARTER_S)
+        self.log(f"Instellingen: climate={self.climate}, vrijgave={self.vrijgave}, dummy={self.dummy}, "
+                 f"cold_tolerance={self.cold_tol}, hot_tolerance={self.hot_tol}, ems_actief_entity={self.ems_actief_entity}")
         self.run_in(self._cyclus, 20)
 
     def _arg(self, naam, default, cast=float):
-        waarde = self.args.get(naam, default)
+        waarde = self._cfg.get(naam, default)
         try:
             return cast(waarde)
         except (TypeError, ValueError):
@@ -105,7 +158,15 @@ class EMSVerwarming(hass.Hass):
             return cast(default)
 
     def _laad_config(self):
-        a = self.args
+        eigen = {k: v for k, v in dict(self.args).items() if k not in self.APPDAEMON_SLEUTELS}
+        onbekend = sorted(k for k in eigen if k not in self.INSTELLINGEN)
+        if onbekend:
+            self.log(f"Onbekende sleutels in apps.yaml genegeerd: {', '.join(onbekend)}", level="WARNING")
+        overschreven = sorted(k for k in eigen if k in self.INSTELLINGEN)
+        if overschreven:
+            self.log(f"Instellingen overschreven via apps.yaml: {', '.join(overschreven)}")
+        self._cfg = {**self.INSTELLINGEN, **{k: v for k, v in eigen.items() if k in self.INSTELLINGEN}}
+        a = self._cfg
         self.climate = a.get("climate", "climate.warmtepomp_regeling")
         self.vrijgave = a.get("vrijgave_entity", "switch.verwarming_vrijgave")
         self.dummy = a.get("dummy_switch", "switch.warmtepomp_status_dummy")
@@ -270,6 +331,12 @@ class EMSVerwarming(hass.Hass):
         return self._zet_dummy(vrijgave == "on", self.datetime(aware=True))
 
     def _apply(self, now, wanted_on, decision, reason, diagnostics, exempt_min_on=False, exempt_min_off=False):
+        if getattr(self, "_shadow", False):
+            self._volg_thermostaat("schaduw")
+            diagnostics.update({"shadow_mode": True, "shadow_wanted_on": wanted_on,
+                                "dummy_state_actual": self._dummy_state()})
+            self._publish_diagnostic("schaduw_" + decision, f"EMS uit (schaduwmodus), zou doen: {reason}", diagnostics)
+            return
         current = self._dummy_state()
         seconds = self._seconds_in_state(now)
         final = wanted_on
@@ -690,11 +757,9 @@ class EMSVerwarming(hass.Hass):
         nu = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
         diag = {}
 
-        # 1. EMS uitgeschakeld?
-        if self.ems_actief_entity and self.get_state(self.ems_actief_entity) == "off":
-            self._volg_thermostaat("ems_uit")
-            self._publish_diagnostic("ems_uit", "input_boolean.ems_actief staat uit; dummy volgt de thermostaat", diag)
-            return
+        # 1. EMS uitgeschakeld = schaduwmodus: alles wordt berekend en gepubliceerd, maar de dummy
+        #    volgt de thermostaat (zie _apply). Zo zie je wat de EMS zou doen voordat je hem live zet.
+        self._shadow = bool(self.ems_actief_entity and self.get_state(self.ems_actief_entity) == "off")
 
         # 2. Basisgegevens
         t_binnen = self._float(self.indoor_entity)
@@ -710,7 +775,7 @@ class EMSVerwarming(hass.Hass):
             return
         if vrijgave not in ("on", "off"):
             self._warn_once("vrijgave", f"{self.vrijgave} heeft geen geldige status. Stel de actuator van de "
-                                        f"thermostaat in op deze boolean; nu geldt alleen de temperatuurgrens.")
+                                        f"thermostaat in op deze schakelaar; nu geldt alleen de temperatuurgrens.")
         floor = target - self.cold_tol
         goal = target + self.hot_tol
         diag.update({
