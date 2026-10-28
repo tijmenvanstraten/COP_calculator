@@ -125,7 +125,7 @@ class EMSVerwarming(hass.Hass):
     }
     APPDAEMON_SLEUTELS = {"module", "class", "name", "priority", "dependencies", "global_dependencies", "log",
                           "log_level", "disable", "plugin", "namespace", "config_dir", "app_dir", "pin_app",
-                          "pin_thread", "production_mode", "use_dictionary_unpacking", "logs", "app_name"}
+                          "pin_thread", "production_mode", "use_dictionary_unpacking", "logs", "app_name", "config_path"}
 
     # ------------------------------------------------------------------ opstarten
     def initialize(self):
@@ -559,15 +559,37 @@ class EMSVerwarming(hass.Hass):
             if age_days > self.MODEL_MAX_AGE_DAYS:
                 return None, f"laatste geaccepteerde fit is {age_days:.1f} dagen oud"
         g = self.THERMAL_MODEL_GAIN_ENTITY
+        e = self.THERMAL_MODEL_INTERNAL_GAIN_ENTITY
+        terugval = []
+
+        def waarde(naam, sleutel, entity, attribuut=None, optioneel=False):
+            """Eerst de directe bron; dan 'parameters' van de kwaliteitssensor. Een optionele parameter die
+            ontbreekt telt als 0 (nulwaarden komen soms niet door als attribuut in Home Assistant)."""
+            v = self._float(entity, attribuut)
+            if v is not None:
+                return v
+            params = self.get_state(self.THERMAL_MODEL_QUALITY_ENTITY, attribute="parameters")
+            if isinstance(params, dict) and sleutel in params:
+                try:
+                    v = float(params[sleutel])
+                    terugval.append(f"{naam}=parameters")
+                    return v
+                except (TypeError, ValueError):
+                    pass
+            if optioneel and self.get_state(g) not in (None, "unknown", "unavailable"):
+                terugval.append(f"{naam}=0")
+                return 0.0
+            return None
+
         model = {
-            "a": self._float("sensor.huis_afkoel_constante"),
-            "b": self._float("sensor.huis_solar_gain_constante"),
-            "c": self._float("sensor.huis_wind_loss_factor"),
-            "g_fast": self._float(g, "g_snel"), "g_slow": self._float(g, "g_traag"),
-            "g_outdoor": self._float(g, "tout_helling_per_10k"), "tau_hours": self._float(g, "tau_traag_uur"),
-            "power_kw": self._float(g, "typisch_vermogen_kw"),
-            "internal_night": self._float(self.THERMAL_MODEL_INTERNAL_GAIN_ENTITY, "nacht"),
-            "internal_day_extra": self._float(self.THERMAL_MODEL_INTERNAL_GAIN_ENTITY, "dag_extra_07_23"),
+            "a": waarde("a", "a", "sensor.huis_afkoel_constante"),
+            "b": waarde("b", "b", "sensor.huis_solar_gain_constante_2"),
+            "c": waarde("c", "c", "sensor.huis_wind_loss_factor", optioneel=True),
+            "g_fast": waarde("g_fast", "g_snel", g, "g_snel"), "g_slow": waarde("g_slow", "g_traag", g, "g_traag"),
+            "g_outdoor": waarde("g_outdoor", "g_t", g, "tout_helling_per_10k", optioneel=True),
+            "tau_hours": self._float(g, "tau_traag_uur"), "power_kw": self._float(g, "typisch_vermogen_kw"),
+            "internal_night": waarde("internal_night", "e0", e, "nacht", optioneel=True),
+            "internal_day_extra": waarde("internal_day_extra", "e1", e, "dag_extra_07_23", optioneel=True),
         }
         missing = [k for k, v in model.items() if v is None]
         if missing:
@@ -580,6 +602,7 @@ class EMSVerwarming(hass.Hass):
         model["input"] = self.get_state(g, attribute="invoer") or "thermisch"
         model["source"] = self.get_state(g, attribute="bron")
         model["simulation"] = "geleerd_rc"
+        model["parameter_fallbacks"] = terugval
         return model, None
 
     def _fallback_model(self):
@@ -589,7 +612,7 @@ class EMSVerwarming(hass.Hass):
             k_opwarm = self.FALLBACK_K_OPWARM
         return {
             "a": self._float("sensor.huis_afkoel_constante") or self.FALLBACK_K_AFKOEL,
-            "b": self._float("sensor.huis_solar_gain_constante") or self.FALLBACK_K_SOLAR,
+            "b": self._float("sensor.huis_solar_gain_constante_2") or self.FALLBACK_K_SOLAR,
             "c": max(0.0, self._float("sensor.huis_wind_loss_factor") or 0.0),
             "g_fast": k_opwarm, "g_slow": 0.0, "g_outdoor": 0.0, "tau_hours": 1.0, "power_kw": 1.0,
             "internal_night": 0.0, "internal_day_extra": 0.0,
@@ -934,6 +957,7 @@ class EMSVerwarming(hass.Hass):
             "wind_forecast_next_4h_kmh": [round(winds[i], 1) for i in (0, 4, 8, 12, 16) if i < n],
             "thermal_model_simulation": model["simulation"], "thermal_model_fallback_reason": reden_fb,
             "thermal_model_source": model["source"], "thermal_model_input": model["input"],
+            "thermal_model_parameter_fallbacks": model.get("parameter_fallbacks"),
             "cop_model": "geleerd" if cop else f"aanname_{self.default_cop}",
             "current_pv_power_w": zon_nu,
         })
