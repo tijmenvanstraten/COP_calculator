@@ -26,6 +26,7 @@ Beslisvolgorde
       pv_kw - verbruik_kw uit dezelfde forecast. Alle prijzen en vermogens komen uit sensor.energie_core_forecast.
 """
 
+import collections
 import datetime
 import math
 import threading
@@ -107,6 +108,7 @@ class EMSVerwarming(hass.Hass):
         "max_binnentemperatuur": 21.5,
         "max_overschrijding": 1.0,
         "minimale_wisseltijd_seconden": 1200,
+        "model_controle_max_mae_3u": 0.4,                         # waarschuwing als het model 3 uur vooruit zo ver afwijkt (K)
         "standaard_cop": 3.0,                                     # alleen als sensor.huis_wp_cop ontbreekt
         # --- Voorverwarmen
         "buffer_marge": 0.5,
@@ -134,6 +136,9 @@ class EMSVerwarming(hass.Hass):
         self._last_command_ts = None
         self._shadow = False
         self._warned = set()
+        self._check_hist = []                                   # gemeten invoer per kwartier (voor modelcontrole)
+        self._check_err = {"1u": collections.deque(maxlen=96), "3u": collections.deque(maxlen=96)}
+        self._check_diag = {}
         self._laad_config()
 
         self.listen_state(self._trigger, self.vrijgave)
@@ -193,6 +198,7 @@ class EMSVerwarming(hass.Hass):
         self.start_deficit = max(0.0, self._arg("min_start_deficit", self.MIN_START_DEFICIT_C))
         self.max_indoor = self._arg("max_binnentemperatuur", self.MAX_INDOOR_C)
         self.overshoot_hard = self._arg("max_overschrijding", self.OVERSHOOT_HARD_C)
+        self.check_max_mae = self._arg("model_controle_max_mae_3u", 0.4)
         self.min_switch_s = self._arg("minimale_wisseltijd_seconden", self.MINIMALE_WISSELTIJD_SECONDEN, float)
         self.buffer_margin = max(0.0, self._arg("buffer_marge", self.BUFFER_TEMPERATURE_MARGIN_C))
         self.preheat_lookahead = max(self.horizon, self._arg("voorverwarmen_vooruitblik_kwartieren",
@@ -257,6 +263,7 @@ class EMSVerwarming(hass.Hass):
         }
         if attributes:
             attrs.update(attributes)
+        attrs.update(getattr(self, "_check_diag", {}))
         try:
             self.set_state(self.DIAGNOSTIC_ENTITY, state=decision, attributes=attrs)
         except Exception as err:  # noqa: BLE001
@@ -270,6 +277,10 @@ class EMSVerwarming(hass.Hass):
         if not self._lock.acquire(blocking=False):
             return
         try:
+            try:
+                self._modelcontrole()
+            except Exception as err:  # noqa: BLE001
+                self.log(f"Modelcontrole mislukt: {err!r}", level="WARNING")
             self._beslis()
         except Exception as err:  # noqa: BLE001
             self.log(f"Fout in EMS-cyclus: {err!r}\n{traceback.format_exc()}", level="ERROR")
@@ -670,6 +681,76 @@ class EMSVerwarming(hass.Hass):
                 + model["g_outdoor"] * next_ema * (outdoor - self.REF_TOUT) / 10.0
                 + model["internal_night"] + model["internal_day_extra"] * day)
         return indoor + rate * self.QUARTER_H, next_ema
+
+    # ------------------------------------------------------------------ live modelcontrole
+    def _kw(self, entity):
+        """Vermogenssensor in kW, ongeacht of de sensor W of kW meldt."""
+        v = self._float(entity)
+        if v is None:
+            return None
+        unit = str(self.get_state(entity, attribute="unit_of_measurement") or "").strip()
+        return v / 1000.0 if (unit == "W" or (unit == "" and abs(v) > 30.0)) else v
+
+    def _modelcontrole(self):
+        """Vergelijkt per kwartier de modelvoorspelling (1 en 3 uur terug, met de GEMETEN invoer van dat
+        moment) met de werkelijke binnentemperatuur. Schrijft MAE en bias naar de diagnostiek."""
+        now = self.datetime(aware=True)
+        model, reden = self._load_thermal_model(now)
+        if model is None:
+            self._check_diag = {"model_check": f"geen geleerd model ({reden})"}
+            self._check_hist.clear()
+            return
+        if self._check_hist and (now - self._check_hist[-1]["ts"]).total_seconds() < 600:
+            return                                           # extra cyclus door een trigger: niet dubbel tellen
+        t_in, t_out = self._float(self.indoor_entity), self._outdoor_now()
+        wind, pv = self._float(self.wind_entity), self._kw(self.pv_entity)
+        if model["input"] == "elektrisch":
+            delen = [self._kw(e) for e in self.electric_power_entities]
+            p = sum(delen) if all(d is not None for d in delen) else None
+        else:
+            p = self._kw(self.thermal_power_entity)
+        if None in (t_in, t_out, wind, pv, p):
+            self._check_hist.clear()                         # gat in de data: opnieuw beginnen
+            return
+        if self._check_hist:
+            prev = self._check_hist[-1]
+            if (now - prev["ts"]).total_seconds() > 1200:
+                self._check_hist.clear()
+        alpha = 1.0 - math.exp(-self.QUARTER_H / model["tau_hours"])
+        if self._check_hist:
+            ema = self._check_hist[-1]["ema"] + alpha * (self._check_hist[-1]["p"] - self._check_hist[-1]["ema"])
+        else:
+            ema = self._initial_ema(model, now)
+        rec = {"ts": now, "T": t_in, "ema": ema, "Tout": t_out, "wind": wind, "pv": pv, "p": p}
+        self._check_hist.append(rec)
+        del self._check_hist[:-20]
+        k = len(self._check_hist) - 1
+        for naam, lag in (("1u", 4), ("3u", 12)):
+            if k < lag:
+                continue
+            start = self._check_hist[k - lag]
+            temp, e = start["T"], start["ema"]
+            for j in range(k - lag, k):
+                r = self._check_hist[j]
+                temp, e = self._simulate_step(model, temp, e, r["Tout"], r["wind"], r["pv"], r["p"], r["ts"])
+            self._check_err[naam].append(temp - t_in)
+        diag = {"model_check_n": len(self._check_err["3u"])}
+        for naam in ("1u", "3u"):
+            fouten = list(self._check_err[naam])
+            if fouten:
+                diag[f"model_check_mae_{naam}_K"] = round(sum(abs(x) for x in fouten) / len(fouten), 3)
+                diag[f"model_check_bias_{naam}_K"] = round(sum(fouten) / len(fouten), 3)
+        mae3 = diag.get("model_check_mae_3u_K")
+        if mae3 is not None and diag["model_check_n"] >= 24 and mae3 > self.check_max_mae:
+            bias = diag.get("model_check_bias_3u_K", 0.0)
+            richting = ("model voorspelt te warm: het huis koelt in werkelijkheid sneller af (a te laag of "
+                        "interne winst te hoog)" if bias > 0 else
+                        "model voorspelt te koud: het huis koelt in werkelijkheid trager af (a te hoog of "
+                        "interne winst te laag)")
+            diag["model_check_hint"] = richting
+            self._warn_once(f"check_{now.date()}", f"Modelcontrole: 3-uurs voorspelling wijkt gemiddeld {mae3} K af "
+                            f"(grens {self.check_max_mae} K, bias {bias} K): {richting}.")
+        self._check_diag = diag
 
     # ------------------------------------------------------------------ vensters plannen
     def _plan(self, model, cop, nu, indoor, temps, winds, pv, prices, target, floor, goal, heating_on, ema0,
