@@ -3,6 +3,7 @@ import datetime
 import threading
 import time
 import math
+import json
 from typing import Dict, List, Optional, Any, Tuple, Set
 from dateutil import tz
 
@@ -796,6 +797,7 @@ class EnergieCorePredictor(hass.Hass):
                         "btw": self.BTW_PERCENTAGE,
                     },
                     "forecast": matrix,
+                    "forecast_json": json.dumps(matrix, separators=(",", ":")),                    
                 }
                 self.set_state(self.forecast_entity, state=nu.isoformat(), attributes=attributes)
                 self.log(f"Forecast gepubliceerd: {len(matrix)} kwartieren, status={status}, "
