@@ -28,6 +28,7 @@ Beslisvolgorde
 
 import collections
 import datetime
+import json
 import math
 import threading
 import time
@@ -63,8 +64,9 @@ class EMSVerwarming(hass.Hass):
     OVERSHOOT_HARD_C = 1.0
     MAX_INDOOR_C = 21.5
 
-    FORECAST_VALUE_KEYS = ("pv_kw", "net_prijs")
-    FORECAST_OPTIONAL_KEYS = ("epex_prijs", "verbruik_kw")      # teruglever-prijs en verwacht huisverbruik
+    FORECAST_VALUE_KEYS = ("net_prijs",)                        # verplicht naast "tijd"
+    # Optioneel. pv_kw ontbreekt in de sensor bij 0 (nacht): dat telt als 0, niet als ontbrekende rij.
+    FORECAST_OPTIONAL_KEYS = ("pv_kw", "epex_prijs", "verbruik_kw")
     FORECAST_MAX_AGE_MIN = 360
     WP_STATUS_AAN = "operation_state_heat_thermo_on"
     OUTDOOR_RANGE = (-30.0, 45.0)
@@ -120,6 +122,12 @@ class EMSVerwarming(hass.Hass):
         "pv_teruglever_correctie": 0.0,
         "pv_waarde_ondergrens": 0.0,
         "pv_basislast_kw": 0.3,
+        "model_sensoren": {                                       # eerste met een getal wint
+            "a": ["sensor.huis_afkoel_constante", "sensor.huis_afkoel_constante_2"],
+            "b": ["sensor.huis_solar_gain_constante_2", "sensor.huis_solar_gain_constante"],
+            "c": ["sensor.huis_wind_loss_factor", "sensor.huis_wind_loss_factor_2"],
+            "opwarm": ["sensor.huis_opwarm_constante", "sensor.huis_opwarm_constante_2"],
+        },
         "pv_teruglever_verschil": None,                           # noodopties als epex_prijs ontbreekt
         "pv_eigenverbruik_waarde": None,
     }
@@ -198,6 +206,7 @@ class EMSVerwarming(hass.Hass):
         self.start_deficit = max(0.0, self._arg("min_start_deficit", self.MIN_START_DEFICIT_C))
         self.max_indoor = self._arg("max_binnentemperatuur", self.MAX_INDOOR_C)
         self.overshoot_hard = self._arg("max_overschrijding", self.OVERSHOOT_HARD_C)
+        self.model_sensoren = {k: list(v) for k, v in a["model_sensoren"].items()}
         self.check_max_mae = self._arg("model_controle_max_mae_3u", 0.4)
         self.min_switch_s = self._arg("minimale_wisseltijd_seconden", self.MINIMALE_WISSELTIJD_SECONDEN, float)
         self.buffer_margin = max(0.0, self._arg("buffer_marge", self.BUFFER_TEMPERATURE_MARGIN_C))
@@ -265,7 +274,10 @@ class EMSVerwarming(hass.Hass):
             attrs.update(attributes)
         attrs.update(getattr(self, "_check_diag", {}))
         try:
-            self.set_state(self.DIAGNOSTIC_ENTITY, state=decision, attributes=attrs)
+            try:
+                self.set_state(self.DIAGNOSTIC_ENTITY, state=decision, attributes=attrs, replace=True)
+            except TypeError:   # AppDaemon-versie zonder replace
+                self.set_state(self.DIAGNOSTIC_ENTITY, state=decision, attributes=attrs)
         except Exception as err:  # noqa: BLE001
             self.log(f"Publiceren van {self.DIAGNOSTIC_ENTITY} mislukt: {err}", level="ERROR")
 
@@ -385,6 +397,8 @@ class EMSVerwarming(hass.Hass):
                     values[key] = v if math.isfinite(v) else None
                 except (KeyError, TypeError, ValueError):
                     values[key] = None
+            if values["pv_kw"] is None:
+                values["pv_kw"] = 0.0
             rows.append({"tijd": start, **values})
         return rows
 
@@ -565,7 +579,7 @@ class EMSVerwarming(hass.Hass):
         def waarde(naam, sleutel, entity, attribuut=None, optioneel=False):
             """Eerst de directe bron; dan 'parameters' van de kwaliteitssensor. Een optionele parameter die
             ontbreekt telt als 0 (nulwaarden komen soms niet door als attribuut in Home Assistant)."""
-            v = self._float(entity, attribuut)
+            v = self._model_sensor(entity) if entity in self.model_sensoren else self._float(entity, attribuut)
             if v is not None:
                 return v
             params = self.get_state(self.THERMAL_MODEL_QUALITY_ENTITY, attribute="parameters")
@@ -582,9 +596,9 @@ class EMSVerwarming(hass.Hass):
             return None
 
         model = {
-            "a": waarde("a", "a", "sensor.huis_afkoel_constante"),
-            "b": waarde("b", "b", "sensor.huis_solar_gain_constante_2"),
-            "c": waarde("c", "c", "sensor.huis_wind_loss_factor", optioneel=True),
+            "a": waarde("a", "a", "a"),
+            "b": waarde("b", "b", "b"),
+            "c": waarde("c", "c", "c", optioneel=True),
             "g_fast": waarde("g_fast", "g_snel", g, "g_snel"), "g_slow": waarde("g_slow", "g_traag", g, "g_traag"),
             "g_outdoor": waarde("g_outdoor", "g_t", g, "tout_helling_per_10k", optioneel=True),
             "tau_hours": self._float(g, "tau_traag_uur"), "power_kw": self._float(g, "typisch_vermogen_kw"),
@@ -607,13 +621,13 @@ class EMSVerwarming(hass.Hass):
 
     def _fallback_model(self):
         """Eenvoudig noodmodel: oude constanten + vaste opwarmsnelheid; geen vloerinertie."""
-        k_opwarm = self._float("sensor.huis_opwarm_constante")
+        k_opwarm = self._model_sensor("opwarm")
         if k_opwarm is None or k_opwarm <= 0:
             k_opwarm = self.FALLBACK_K_OPWARM
         return {
-            "a": self._float("sensor.huis_afkoel_constante") or self.FALLBACK_K_AFKOEL,
-            "b": self._float("sensor.huis_solar_gain_constante_2") or self.FALLBACK_K_SOLAR,
-            "c": max(0.0, self._float("sensor.huis_wind_loss_factor") or 0.0),
+            "a": self._model_sensor("a") or self.FALLBACK_K_AFKOEL,
+            "b": self._model_sensor("b") or self.FALLBACK_K_SOLAR,
+            "c": max(0.0, self._model_sensor("c") or 0.0),
             "g_fast": k_opwarm, "g_slow": 0.0, "g_outdoor": 0.0, "tau_hours": 1.0, "power_kw": 1.0,
             "internal_night": 0.0, "internal_day_extra": 0.0,
             "input": "thermisch", "source": "fallback", "simulation": "eenvoudig_fallback",
@@ -706,6 +720,27 @@ class EMSVerwarming(hass.Hass):
         return indoor + rate * self.QUARTER_H, next_ema
 
     # ------------------------------------------------------------------ live modelcontrole
+    def _lees_forecast(self):
+        """Forecast uit het attribuut 'forecast_json' (tekst, nullen blijven behouden) of, als dat ontbreekt,
+        uit 'forecast' (lijst; daarin kunnen nulwaarden ontbreken)."""
+        tekst = self.get_state(self.forecast_entity, attribute="forecast_json")
+        if isinstance(tekst, str) and tekst.strip():
+            try:
+                data = json.loads(tekst)
+                if isinstance(data, list):
+                    return data, "forecast_json"
+            except ValueError:
+                self._warn_once("fjson", f"{self.forecast_entity}: forecast_json is geen geldige JSON; 'forecast' gebruikt.")
+        return self.get_state(self.forecast_entity, attribute="forecast"), "forecast"
+
+    def _model_sensor(self, key):
+        """Waarde van de eerste modelsensor (zie model_sensoren) die een getal geeft."""
+        for ent in self.model_sensoren.get(key, []):
+            v = self._float(ent)
+            if v is not None:
+                return v
+        return None
+
     def _kw(self, entity):
         """Vermogenssensor in kW, ongeacht of de sensor W of kW meldt."""
         v = self._float(entity)
@@ -757,7 +792,7 @@ class EMSVerwarming(hass.Hass):
                 r = self._check_hist[j]
                 temp, e = self._simulate_step(model, temp, e, r["Tout"], r["wind"], r["pv"], r["p"], r["ts"])
             self._check_err[naam].append(temp - t_in)
-        diag = {"model_check_n": len(self._check_err["3u"])}
+        diag = {"model_check": "actief", "model_check_n": len(self._check_err["3u"])}
         for naam in ("1u", "3u"):
             fouten = list(self._check_err[naam])
             if fouten:
@@ -910,9 +945,9 @@ class EMSVerwarming(hass.Hass):
             return
 
         # 6. Prijs/PV-forecast
-        raw_forecast = self.get_state(self.forecast_entity, attribute="forecast")
+        raw_forecast, forecast_bron = self._lees_forecast()
         forecast = self._validate_forecast(raw_forecast)
-        diag.update({"forecast_valid_rows": len(forecast),
+        diag.update({"forecast_valid_rows": len(forecast), "forecast_bron": forecast_bron,
                      "forecast_status": self.get_state(self.forecast_entity, attribute="status"),
                      "forecast_generated_at": self.get_state(self.forecast_entity, attribute="generated_at")})
         zon_nu = self._float(self.pv_entity) or 0.0
