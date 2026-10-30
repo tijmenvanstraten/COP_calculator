@@ -110,7 +110,12 @@ class EMSVerwarming(hass.Hass):
         "max_binnentemperatuur": 21.5,
         "max_overschrijding": 1.0,
         "minimale_wisseltijd_seconden": 1200,
-        "model_controle_max_mae_3u": 0.4,                         # waarschuwing als het model 3 uur vooruit zo ver afwijkt (K)
+        "model_controle_max_mae_3u": 0.4,
+        # --- Planning voor grafieken (0 = uit)
+        "planning_kwartieren": 48,                                # 12 uur
+        "planning_entity": "sensor.ems_verwarming_planning",
+        "planning_start_entity": "sensor.ems_verwarming_volgende_start",
+        "planning_einde_entity": "sensor.ems_verwarming_volgend_einde",                         # waarschuwing als het model 3 uur vooruit zo ver afwijkt (K)
         "standaard_cop": 3.0,                                     # alleen als sensor.huis_wp_cop ontbreekt
         # --- Voorverwarmen
         "buffer_marge": 0.5,
@@ -143,6 +148,7 @@ class EMSVerwarming(hass.Hass):
         self._last_outdoor = None
         self._last_command_ts = None
         self._shadow = False
+        self._planning_klaar = False
         self._warned = set()
         self._check_hist = []                                   # gemeten invoer per kwartier (voor modelcontrole)
         self._check_err = {"1u": collections.deque(maxlen=96), "3u": collections.deque(maxlen=96)}
@@ -207,6 +213,10 @@ class EMSVerwarming(hass.Hass):
         self.max_indoor = self._arg("max_binnentemperatuur", self.MAX_INDOOR_C)
         self.overshoot_hard = self._arg("max_overschrijding", self.OVERSHOOT_HARD_C)
         self.model_sensoren = {k: list(v) for k, v in a["model_sensoren"].items()}
+        self.planning_q = max(0, self._arg("planning_kwartieren", 48, int))
+        self.planning_entity = a["planning_entity"]
+        self.planning_start_entity = a["planning_start_entity"]
+        self.planning_einde_entity = a["planning_einde_entity"]
         self.check_max_mae = self._arg("model_controle_max_mae_3u", 0.4)
         self.min_switch_s = self._arg("minimale_wisseltijd_seconden", self.MINIMALE_WISSELTIJD_SECONDEN, float)
         self.buffer_margin = max(0.0, self._arg("buffer_marge", self.BUFFER_TEMPERATURE_MARGIN_C))
@@ -354,6 +364,8 @@ class EMSVerwarming(hass.Hass):
         return self._zet_dummy(vrijgave == "on", self.datetime(aware=True))
 
     def _apply(self, now, wanted_on, decision, reason, diagnostics, exempt_min_on=False, exempt_min_off=False):
+        if not self._planning_klaar:
+            self._planning_leeg(decision, reason)
         if getattr(self, "_shadow", False):
             self._volg_thermostaat("schaduw")
             diagnostics.update({"shadow_mode": True, "shadow_wanted_on": wanted_on,
@@ -895,6 +907,7 @@ class EMSVerwarming(hass.Hass):
         now = self.datetime(aware=True)
         nu = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
         diag = {}
+        self._planning_klaar = False
 
         # 1. EMS uitgeschakeld = schaduwmodus: alles wordt berekend en gepubliceerd, maar de dummy
         #    volgt de thermostaat (zie _apply). Zo zie je wat de EMS zou doen voordat je hem live zet.
@@ -966,7 +979,7 @@ class EMSVerwarming(hass.Hass):
             self._apply(now, False, "basisregeling", "forecast ontbreekt; alleen thermostaat bepaalt", diag)
             return
         gem_prijs = sum(r["net_prijs"] for r in forecast) / len(forecast)
-        n = max(self.horizon, self.preheat_lookahead) + self.MAX_MODEL_HEATING_QUARTERS + 1
+        n = max(self.horizon, self.preheat_lookahead) + self.MAX_MODEL_HEATING_QUARTERS + 1 + self.planning_q
         prices, pv, epex, load = self._kwartier_reeksen(forecast, nu, n, gem_prijs)
         prijs_nu = prices[0]
         diag["current_net_price_eur_kwh"] = prijs_nu
@@ -997,6 +1010,7 @@ class EMSVerwarming(hass.Hass):
             "current_pv_power_w": zon_nu,
         })
 
+        prices_raw = list(prices)
         pv_actief = self.pv_aware and not (self.pv_delta_from is not None and now.date() < self.pv_delta_from)
         heeft_epex = any(e is not None for e in epex)
         if pv_actief and (heeft_epex or self.pv_delta is not None or self.pv_value is not None):
@@ -1024,6 +1038,22 @@ class EMSVerwarming(hass.Hass):
         heating_on = dummy_state == "on"
         ema0 = self._initial_ema(model, now) if model["simulation"] == "geleerd_rc" else 0.0
         diag["initial_ema_kw"] = round(ema0, 3)
+        wanted, decision, reason = self._strategie(model, cop, nu, t_binnen, temps, winds, pv, prices, target, floor,
+                                                    goal, heating_on, ema0, diag)
+        if self.planning_q > 0:
+            try:
+                tijd0 = time.monotonic()
+                self._publiceer_planning(model, cop, nu, t_binnen, ema0, temps, winds, pv, prices, prices_raw,
+                                         target, floor, goal, heating_on, diag)
+                diag["planning_rekentijd_s"] = round(time.monotonic() - tijd0, 2)
+            except Exception as err:  # noqa: BLE001
+                self.log(f"Planning berekenen mislukt: {err!r}\n{traceback.format_exc()}", level="WARNING")
+        self._apply(now, wanted, decision, reason, diag)
+
+    # ------------------------------------------------------------------ strategie (live en in de planning)
+    def _strategie(self, model, cop, nu, t_binnen, temps, winds, pv, prices, target, floor, goal, heating_on,
+                   ema0, diag):
+        """Kiest aan/uit voor het kwartier dat bij `nu` begint. Geeft (aan, besluit, reden)."""
         plan = self._plan(model, cop, nu, t_binnen, temps, winds, pv, prices, target, floor, goal, heating_on, ema0)
         candidates = plan["candidates"]
         need_q = plan["need_q"]
@@ -1032,12 +1062,9 @@ class EMSVerwarming(hass.Hass):
             "heating_need_in_minutes": need_q * 15 if need_q is not None else None,
             "valid_windows": len(candidates),
         })
-
-        # 8a. Voorspelde warmtevraag binnen de horizon
         if need_q is not None:
             if not candidates:
-                self._apply(now, True, "aan", "geen startmoment houdt de comfortondergrens; nu starten", diag)
-                return
+                return True, "aan", "geen startmoment houdt de comfortondergrens; nu starten"
             best = min(candidates, key=lambda c: (c["cost"], c["start_q"]))
             current = next((c for c in candidates if c["start_q"] == 0), None)
             diag.update({"best_window_start_minutes": best["start_q"] * 15,
@@ -1046,23 +1073,115 @@ class EMSVerwarming(hass.Hass):
             if current is None:
                 if self._voorverwarmen(model, cop, nu, t_binnen, temps, winds, pv, prices, target, floor, goal,
                                        heating_on, ema0, diag):
-                    self._apply(now, True, "aan_voorverwarmen",
-                                "nu goedkoper dan het komende stookvenster; warmte opslaan", diag)
-                else:
-                    self._apply(now, False, "wachten",
-                                f"verwarmen start liefst over {best['start_q'] * 15} min (goedkoopste venster)", diag)
-                return
+                    return True, "aan_voorverwarmen", "nu goedkoper dan het komende stookvenster; warmte opslaan"
+                return False, "wachten", f"verwarmen start liefst over {best['start_q'] * 15} min (goedkoopste venster)"
             tol = self.PRICE_WINDOW_TOLERANCE_EUR + (self.PRICE_HYSTERESIS_EUR if heating_on else 0.0)
             diag["current_window_cost_eur"] = round(current["cost"], 4)
             if current["cost"] <= best["cost"] + tol * current["energy"]:
-                self._apply(now, True, "aan", "warmtevraag voorspeld en kosten nu binnen de optimale marge", diag)
-            else:
-                self._apply(now, False, "wachten", "later verwarmingsvenster is goedkoper", diag)
-            return
-
-        # 8b. Geen warmtevraag binnen de horizon: voorverwarmen als er verderop wel vraag is en nu goedkoper is
+                return True, "aan", "warmtevraag voorspeld en kosten nu binnen de optimale marge"
+            return False, "wachten", "later verwarmingsvenster is goedkoper"
         if self._voorverwarmen(model, cop, nu, t_binnen, temps, winds, pv, prices, target, floor, goal,
                                heating_on, ema0, diag):
-            self._apply(now, True, "aan_voorverwarmen", "nu goedkoper dan het komende stookvenster; warmte opslaan", diag)
+            return True, "aan_voorverwarmen", "nu goedkoper dan het komende stookvenster; warmte opslaan"
+        return False, "uit", f"geen warmtevraag binnen de horizon ({diag.get('preheat')})"
+
+    # ------------------------------------------------------------------ planning (voor grafieken)
+    def _planning_simulatie(self, model, cop, nu, t0, ema0, temps, winds, pv, prices, prices_raw, target, floor,
+                            goal, heating_on):
+        """Simuleert dezelfde regels kwartier voor kwartier vooruit: thermostaat-comfortvraag, harde grens,
+        en de EMS-strategie (inclusief minimale wisseltijd). Geeft een rij per kwartier."""
+        min_q = max(1, int(math.ceil(self.min_switch_s / self.QUARTER_S)))
+        temp, ema, aan, sinds = t0, ema0, heating_on, min_q
+        vraag = False
+        rijen = []
+        for q in range(self.planning_q):
+            tq = nu + datetime.timedelta(minutes=15 * q)
+            t_start = temp
+            if temp <= floor:
+                vraag = True
+            elif temp >= goal:
+                vraag = False
+            te_warm = temp >= target + self.overshoot_hard or temp >= self.max_indoor
+            if te_warm:
+                wens, dwingend = False, True
+            elif vraag or temp < floor:
+                wens, dwingend = True, True
+            else:
+                wens, _, _ = self._strategie(model, cop, tq, temp, temps[q:], winds[q:], pv[q:], prices[q:], target,
+                                             floor, goal, aan, ema, {})
+                dwingend = False
+            if wens != aan and (sinds >= min_q or dwingend):
+                aan, sinds = wens, 0
+            sinds += 1
+            p_in, p_el, _c = self._heat_params(model, cop, temps[q])
+            rijen.append({"tq": tq, "binnen": t_start, "buiten": temps[q], "aan": aan, "p_el": p_el,
+                          "prijs": prices_raw[q], "prijs_eff": prices[q]})
+            temp, ema = self._simulate_step(model, temp, ema, temps[q], winds[q], pv[q], p_in if aan else 0.0, tq)
+        return rijen
+
+    def _zet_attr_sensor(self, entity, state, attrs):
+        try:
+            try:
+                self.set_state(entity, state=state, attributes=attrs, replace=True)
+            except TypeError:
+                self.set_state(entity, state=state, attributes=attrs)
+        except Exception as err:  # noqa: BLE001
+            self.log(f"Publiceren van {entity} mislukt: {err}", level="WARNING")
+
+    def _publiceer_planning(self, model, cop, nu, t_binnen, ema0, temps, winds, pv, prices, prices_raw, target,
+                            floor, goal, heating_on, diag):
+        sim = self._planning_simulatie(model, cop, nu, t_binnen, ema0, temps, winds, pv, prices, prices_raw,
+                                       target, floor, goal, heating_on)
+        planning, starts, einde = [], [], []
+        vorige = heating_on
+        kwh = kosten = 0.0
+        for r in sim:
+            rij = {"tijd": r["tq"].isoformat(), "binnen_c": round(r["binnen"], 2), "buiten_c": round(r["buiten"], 1),
+                   "net_prijs": round(r["prijs"], 4), "ondergrens_c": round(floor, 2), "doel_c": round(goal, 2)}
+            if r["aan"]:
+                energie = r["p_el"] * self.QUARTER_H
+                rij["verwarmen_kwh"] = round(energie, 3)     # kwartieren zonder verwarming krijgen geen veld (= 0)
+                rij["verwarmen_kw"] = round(r["p_el"], 3)
+                kwh += energie
+                kosten += energie * r["prijs_eff"]
+            if r["aan"] and not vorige:
+                starts.append(r["tq"])
+            if vorige and not r["aan"]:
+                einde.append(r["tq"])
+            vorige = r["aan"]
+            planning.append(rij)
+        temps_pl = [r["binnen"] for r in sim]
+        samenvatting = {
+            "berekend_om": self.datetime(aware=True).isoformat(), "horizon_kwartieren": self.planning_q,
+            "aantal_starts": len(starts), "geplande_kwh_elektrisch": round(kwh, 2),
+            "geplande_kosten_eur": round(kosten, 3),
+            "gem_prijs_eur_kwh": round(kosten / kwh, 4) if kwh > 0 else None,
+            "min_binnen_c": round(min(temps_pl), 2), "max_binnen_c": round(max(temps_pl), 2),
+            "thermisch_model": model["simulation"], "cop_model": "geleerd" if cop else f"aanname_{self.default_cop}",
+        }
+        if heating_on:
+            status = "verwarmen actief"
+        elif starts:
+            status = "verwarmen gepland"
         else:
-            self._apply(now, False, "uit", f"geen warmtevraag binnen de horizon ({diag.get('preheat')})", diag)
+            status = "geen verwarming gepland"
+        self._zet_attr_sensor(self.planning_entity, status, {
+            "friendly_name": "EMS verwarming planning", "icon": "mdi:chart-timeline-variant",
+            "eenheid_verwarmen_kwh": "kWh per kwartier (elektrisch)", **samenvatting, "planning": planning})
+        for entity, lijst, naam in ((self.planning_start_entity, starts, "EMS verwarming volgende start"),
+                                    (self.planning_einde_entity, einde, "EMS verwarming volgend einde")):
+            self._zet_attr_sensor(entity, lijst[0].isoformat() if lijst else "unknown",
+                                  {"friendly_name": naam, "device_class": "timestamp", "icon": "mdi:clock-outline"})
+        self._planning_klaar = True
+
+    def _planning_leeg(self, decision, reden):
+        """Geen planning beschikbaar (bijv. thermostaat uit of comfortvraag): toon dat expliciet."""
+        if self.planning_q <= 0:
+            return
+        self._zet_attr_sensor(self.planning_entity, "geen planning", {
+            "friendly_name": "EMS verwarming planning", "icon": "mdi:chart-timeline-variant",
+            "reden": f"{decision}: {reden}", "berekend_om": self.datetime(aware=True).isoformat(), "planning": []})
+        for entity, naam in ((self.planning_start_entity, "EMS verwarming volgende start"),
+                             (self.planning_einde_entity, "EMS verwarming volgend einde")):
+            self._zet_attr_sensor(entity, "unknown", {"friendly_name": naam, "device_class": "timestamp"})
+        self._planning_klaar = True
